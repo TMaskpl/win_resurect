@@ -183,3 +183,101 @@ function Test-ImageFilePresent {
             Where-Object { ($_.Extension -eq '.vhdx' -or $_.Extension -eq '.vhd') -and $_.Length -gt 0 })
     return ($f.Count -gt 0)
 }
+
+function Invoke-ResurectBackup {
+    param(
+        [Parameter(Mandatory)]$Params,
+        [Parameter(Mandatory)]$Target,
+        [Parameter(Mandatory)]$Facts,
+        [Parameter(Mandatory)][string[]]$Volumes,
+        [Parameter(Mandatory)][scriptblock]$Runner,
+        [string]$Password = '',
+        [string]$ComputerName = $env:COMPUTERNAME,
+        [datetime]$Now = (Get-Date),
+        [string]$OsCaption = '',
+        [string]$OsVersion = '',
+        [object[]]$VolumeInfo = @()
+    )
+    $log = New-Object System.Collections.ArrayList
+    $secrets = @($Password)
+    $say = { param($m) [void]$log.Add((Hide-Secrets -Text $m -Secrets $secrets)) }
+    $started = Get-Date
+    $code = 0
+    $status = 'OK'
+    $connected = $false
+    $smb = ($Params.Target -eq 'smb')
+    try {
+        $pf = Test-Preflight -Facts $Facts
+        foreach ($w in $pf.Warnings) { & $say "Ostrzeżenie: $w" }
+        if ($pf.Errors.Count -gt 0) {
+            foreach ($e in $pf.Errors) { & $say "Błąd: $e" }
+            $code = 2; $status = 'PRZERWANO (kontrole przed startem)'
+        }
+        if ($code -eq 0 -and $smb -and -not $Password) {
+            & $say 'Błąd: podaj hasło do udziału SMB.'
+            $code = 2; $status = 'PRZERWANO (brak hasła)'
+        }
+        if ($code -eq 0 -and $smb) {
+            $c = & $Runner 'net' @('use', $Params.Share, $Password, "/user:$($Params.User)")
+            if ($c.ExitCode -ne 0) {
+                & $say 'Błąd: nie można połączyć się z udziałem SMB (sprawdź adres, użytkownika i hasło).'
+                $code = 2; $status = 'PRZERWANO (brak połączenia z udziałem)'
+            }
+            else { $connected = $true; & $say "Połączono z udziałem $($Params.Share)." }
+        }
+        $driversDir = Join-Path $Target.DocDir 'drivers'
+        if ($code -eq 0) {
+            try { New-Item -ItemType Directory -Force -Path $driversDir -ErrorAction Stop | Out-Null }
+            catch {
+                & $say 'Błąd: nie można utworzyć katalogu na nośniku docelowym.'
+                $code = 2; $status = 'PRZERWANO (brak zapisu na nośniku)'
+            }
+        }
+        if ($code -eq 0) {
+            $d = & $Runner 'pnputil' @('/export-driver', '*', $driversDir)
+            if ($d.ExitCode -ne 0) { & $say 'Ostrzeżenie: eksport sterowników nie powiódł się.' }
+            else { & $say 'Wyeksportowano sterowniki.' }
+        }
+        if ($code -eq 0) {
+            & $say "Start kopii obrazu: $($Volumes -join ', ') -> $($Target.BackupTarget)"
+            $w = & $Runner 'wbadmin' (Get-WbadminArgs -BackupTarget $Target.BackupTarget -Volumes $Volumes)
+            if ($w.ExitCode -ne 0) {
+                $tail = (@($w.Output | Where-Object { $_ } | Select-Object -Last 3) -join ' | ')
+                & $say "Błąd: wbadmin zakończył się kodem $($w.ExitCode): $tail"
+                $code = 1; $status = 'BŁĄD (wbadmin)'
+            }
+        }
+        if ($code -eq 0) {
+            $v = & $Runner 'wbadmin' @('get', 'versions', "-backupTarget:$($Target.BackupTarget)")
+            $listed = ($v.ExitCode -eq 0) -and ((@($v.Output) -join "`n") -match '\d{1,2}/\d{1,2}/\d{4}-\d{1,2}:\d{2}')
+            $present = Test-ImageFilePresent -Root $Target.ImageRoot
+            if ($listed -and $present) { & $say 'Weryfikacja: kopia widoczna w wbadmin, plik obrazu istnieje.' }
+            else {
+                & $say 'Błąd: weryfikacja kopii nie powiodła się (brak wersji w wbadmin lub brak pliku obrazu).'
+                $code = 1; $status = 'BŁĄD (weryfikacja)'
+            }
+        }
+        if (Test-Path -LiteralPath $Target.DocDir) {
+            try {
+                $info = [pscustomobject]@{
+                    ToolVersion = $script:ToolVersion; ComputerName = $ComputerName; OsCaption = $OsCaption; OsVersion = $OsVersion
+                    Date = $Now; Target = $Params.Target; Drive = $Params.Drive; BackupTarget = $Target.BackupTarget
+                    Status = $status; DurationSec = ((Get-Date) - $started).TotalSeconds
+                    Volumes = @($VolumeInfo); BitLocker = [bool]$Facts.BitLockerProtected
+                }
+                Set-Content -LiteralPath (Join-Path $Target.DocDir 'manifest.txt') -Value (New-Manifest -Info $info) -Encoding UTF8
+                if ($code -eq 0) {
+                    Set-Content -LiteralPath (Join-Path $Target.DocDir 'PRZYWRACANIE.txt') -Value (New-RestoreInstructions -Info $info) -Encoding UTF8
+                }
+                Set-Content -LiteralPath (Join-Path $Target.DocDir 'log.txt') -Value @($log) -Encoding UTF8
+            }
+            catch { & $say 'Ostrzeżenie: nie udało się zapisać dokumentów na nośniku.' }
+        }
+    }
+    finally {
+        if ($connected) {
+            try { & $Runner 'net' @('use', $Params.Share, '/delete') | Out-Null; & $say 'Odłączono udział.' } catch { }
+        }
+    }
+    return [pscustomobject]@{ ExitCode = $code; Status = $status; DocDir = $Target.DocDir; Messages = @($log) }
+}

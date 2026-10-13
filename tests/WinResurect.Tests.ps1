@@ -219,3 +219,123 @@ Describe 'documents' {
         Test-ImageFilePresent -Root $root | Should -BeTrue
     }
 }
+
+Describe 'Invoke-ResurectBackup' {
+    BeforeAll {
+        $script:paramsUsb = [pscustomobject]@{ Target = 'usb'; Drive = 'E:'; Share = ''; User = ''; Folder = 'WinResurect' }
+        $script:paramsSmb = [pscustomobject]@{ Target = 'smb'; Drive = ''; Share = '\\nas\share'; User = 'uzytkownik'; Folder = 'WinResurect' }
+        function New-OrchFacts {
+            param([hashtable]$Overrides = @{})
+            $f = [ordered]@{
+                IsAdmin = $true; HasWbadmin = $true; Volumes = @('C:'); Target = 'usb'; TargetFound = $true
+                TargetFileSystem = 'NTFS'; TargetIsSystemDisk = $false; TargetFreeBytes = [long]500GB; UsedBytes = [long]100GB
+                OnBattery = $false; BitLockerProtected = $false; BitLockerKeyConfirmed = $false
+            }
+            foreach ($k in $Overrides.Keys) { $f[$k] = $Overrides[$k] }
+            [pscustomobject]$f
+        }
+        function Invoke-Orch {
+            param($Params, $Facts, [string]$Password = '')
+            Invoke-ResurectBackup -Params $Params -Target $script:target -Facts $Facts -Volumes @('C:') -Runner $script:runner `
+                -Password $Password -ComputerName 'PC1' -Now ([datetime]'2026-10-13T09:40:00') -OsCaption 'Windows 11' -OsVersion '10.0' -VolumeInfo $script:vinfo
+        }
+    }
+    BeforeEach {
+        $script:root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        $script:imageRoot = Join-Path $script:root 'WindowsImageBackup'
+        $script:target = [pscustomobject]@{ BackupTarget = 'E:'; DocDir = (Join-Path $script:root 'doc'); ImageRoot = $script:imageRoot; Leaf = 'PC1_x' }
+        $script:calls = New-Object System.Collections.ArrayList
+        $script:wbFail = $false; $script:netFail = $false; $script:pnpFail = $false; $script:noImage = $false
+        $script:runner = {
+            param($Exe, $ArgList)
+            $script:calls.Add(("$Exe " + ($ArgList -join ' '))) | Out-Null
+            if ($Exe -eq 'wbadmin' -and $ArgList[0] -eq 'start') {
+                if ($script:wbFail) { return @{ ExitCode = 5; Output = @('Błąd: brak miejsca', 'szczegóły -password:Sekret1') } }
+                if (-not $script:noImage) {
+                    New-Item -ItemType Directory -Force -Path $script:imageRoot | Out-Null
+                    Set-Content -Path (Join-Path $script:imageRoot 'obraz.vhdx') -Value 'x'
+                }
+                return @{ ExitCode = 0; Output = @() }
+            }
+            if ($Exe -eq 'wbadmin' -and $ArgList[0] -eq 'get') { return @{ ExitCode = 0; Output = @('Identyfikator wersji: 10/13/2026-09:40') } }
+            if ($Exe -eq 'net' -and $script:netFail -and ($ArgList -notcontains '/delete')) { return @{ ExitCode = 2; Output = @('Błąd systemu 53') } }
+            if ($Exe -eq 'pnputil' -and $script:pnpFail) { return @{ ExitCode = 1; Output = @() } }
+            return @{ ExitCode = 0; Output = @() }
+        }
+        $script:vinfo = @([pscustomobject]@{ Drive = 'C:'; Used = [long]1GB })
+    }
+
+    It 'backs up to USB: drivers, image, verification, documents, no network calls' {
+        $r = Invoke-Orch $script:paramsUsb (New-OrchFacts)
+        $r.ExitCode | Should -Be 0
+        $r.Status | Should -Be 'OK'
+        @($script:calls) | Should -Be @(
+            "pnputil /export-driver * $(Join-Path $script:target.DocDir 'drivers')",
+            'wbadmin start backup -backupTarget:E: -include:C: -allCritical -quiet',
+            'wbadmin get versions -backupTarget:E:')
+        foreach ($f in 'manifest.txt', 'log.txt', 'PRZYWRACANIE.txt') { Test-Path (Join-Path $script:target.DocDir $f) | Should -BeTrue }
+        Test-Path (Join-Path $script:target.DocDir 'drivers') | Should -BeTrue
+    }
+
+    It 'connects to SMB, backs up, disconnects, and never leaks the password into files or messages' {
+        $facts = New-OrchFacts @{ Target = 'smb'; TargetFileSystem = ''; TargetFreeBytes = $null }
+        $r = Invoke-Orch $script:paramsSmb $facts 'Sekret1'
+        $r.ExitCode | Should -Be 0
+        $script:calls[0] | Should -Be 'net use \\nas\share Sekret1 /user:uzytkownik'
+        $script:calls[-1] | Should -Be 'net use \\nas\share /delete'
+        $all = (Get-ChildItem $script:target.DocDir -Recurse -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+        $all | Should -Not -Match 'Sekret1'
+        ($r.Messages -join "`n") | Should -Not -Match 'Sekret1'
+    }
+
+    It 'stops before touching anything when preflight fails' {
+        $r = Invoke-Orch $script:paramsUsb (New-OrchFacts @{ IsAdmin = $false })
+        $r.ExitCode | Should -Be 2
+        $script:calls.Count | Should -Be 0
+        Test-Path $script:target.DocDir | Should -BeFalse
+    }
+
+    It 'requires a password for SMB' {
+        $facts = New-OrchFacts @{ Target = 'smb'; TargetFileSystem = ''; TargetFreeBytes = $null }
+        $r = Invoke-Orch $script:paramsSmb $facts ''
+        $r.ExitCode | Should -Be 2
+        $script:calls.Count | Should -Be 0
+    }
+
+    It 'stops with code 2 when the share cannot be connected and runs no image command' {
+        $script:netFail = $true
+        $facts = New-OrchFacts @{ Target = 'smb'; TargetFileSystem = ''; TargetFreeBytes = $null }
+        $r = Invoke-Orch $script:paramsSmb $facts 'Sekret1'
+        $r.ExitCode | Should -Be 2
+        $script:calls.Count | Should -Be 1
+        ($r.Messages -join "`n") | Should -Not -Match 'Sekret1'
+        Test-Path $script:target.DocDir | Should -BeFalse
+    }
+
+    It 'reports code 1 when wbadmin fails: masked log, error manifest, no restore instructions, share disconnected' {
+        $script:wbFail = $true
+        $facts = New-OrchFacts @{ Target = 'smb'; TargetFileSystem = ''; TargetFreeBytes = $null }
+        $r = Invoke-Orch $script:paramsSmb $facts 'Sekret1'
+        $r.ExitCode | Should -Be 1
+        $log = Get-Content -LiteralPath (Join-Path $script:target.DocDir 'log.txt') -Raw
+        $log | Should -Not -Match 'Sekret1'
+        $log | Should -Match 'brak miejsca'
+        (Get-Content -LiteralPath (Join-Path $script:target.DocDir 'manifest.txt') -Raw) | Should -Match 'Wynik: BŁĄD'
+        Test-Path (Join-Path $script:target.DocDir 'PRZYWRACANIE.txt') | Should -BeFalse
+        $script:calls[-1] | Should -Be 'net use \\nas\share /delete'
+    }
+
+    It 'fails verification when no image file appears' {
+        $script:noImage = $true
+        $r = Invoke-Orch $script:paramsUsb (New-OrchFacts)
+        $r.ExitCode | Should -Be 1
+        Test-Path (Join-Path $script:target.DocDir 'PRZYWRACANIE.txt') | Should -BeFalse
+    }
+
+    It 'treats a driver export failure as a warning only' {
+        $script:pnpFail = $true
+        $r = Invoke-Orch $script:paramsUsb (New-OrchFacts)
+        $r.ExitCode | Should -Be 0
+        (Get-Content -LiteralPath (Join-Path $script:target.DocDir 'log.txt') -Raw) | Should -Match 'sterowników'
+    }
+}
