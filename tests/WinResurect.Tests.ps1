@@ -88,3 +88,84 @@ Describe 'volume selection' {
         Get-UsedBytes -Volumes $script:vols -Selected @('C:', 'D:') | Should -Be ([long]300GB)
     }
 }
+
+Describe 'Test-Preflight' {
+    BeforeAll {
+        function New-TestFacts {
+            param([hashtable]$Overrides = @{})
+            $f = [ordered]@{
+                IsAdmin = $true; HasWbadmin = $true; Volumes = @('C:'); Target = 'usb'; TargetFound = $true
+                TargetFileSystem = 'NTFS'; TargetIsSystemDisk = $false; TargetFreeBytes = [long]500GB; UsedBytes = [long]100GB
+                OnBattery = $false; BitLockerProtected = $false; BitLockerKeyConfirmed = $false
+            }
+            foreach ($k in $Overrides.Keys) { $f[$k] = $Overrides[$k] }
+            [pscustomobject]$f
+        }
+    }
+
+    It 'passes for a healthy USB setup' {
+        $r = Test-Preflight -Facts (New-TestFacts)
+        $r.Errors.Count | Should -Be 0
+        $r.Warnings.Count | Should -Be 0
+    }
+
+    It 'requires administrator and wbadmin and at least one volume' {
+        (Test-Preflight -Facts (New-TestFacts @{ IsAdmin = $false })).Errors -join ' ' | Should -Match 'administrator'
+        (Test-Preflight -Facts (New-TestFacts @{ HasWbadmin = $false })).Errors -join ' ' | Should -Match 'wbadmin'
+        (Test-Preflight -Facts (New-TestFacts @{ Volumes = @() })).Errors -join ' ' | Should -Match 'woluminów'
+    }
+
+    It 'requires the USB disk to exist, be NTFS and not share the system disk' {
+        (Test-Preflight -Facts (New-TestFacts @{ TargetFound = $false })).Errors -join ' ' | Should -Match 'Nie znaleziono'
+        (Test-Preflight -Facts (New-TestFacts @{ TargetFileSystem = 'FAT32' })).Errors -join ' ' | Should -Match 'NTFS'
+        (Test-Preflight -Facts (New-TestFacts @{ TargetIsSystemDisk = $true })).Errors -join ' ' | Should -Match 'fizycznym dysku'
+    }
+
+    It 'needs 10 percent more free space than used space' {
+        $r = Test-Preflight -Facts (New-TestFacts @{ TargetFreeBytes = [long]105GB })
+        $r.Errors -join ' ' | Should -Match 'Za mało miejsca'
+        (Test-Preflight -Facts (New-TestFacts @{ TargetFreeBytes = [long]110GB })).Errors.Count | Should -Be 0
+    }
+
+    It 'only warns when free space on the target is unknown (SMB)' {
+        $r = Test-Preflight -Facts (New-TestFacts @{ Target = 'smb'; TargetFound = $true; TargetFileSystem = ''; TargetFreeBytes = $null })
+        $r.Errors.Count | Should -Be 0
+        $r.Warnings -join ' ' | Should -Match 'wolnego miejsca'
+    }
+
+    It 'warns on battery' {
+        (Test-Preflight -Facts (New-TestFacts @{ OnBattery = $true })).Warnings -join ' ' | Should -Match 'bateri'
+    }
+
+    It 'blocks BitLocker without a confirmed recovery key and allows it with one' {
+        $blocked = Test-Preflight -Facts (New-TestFacts @{ BitLockerProtected = $true })
+        $blocked.Errors -join ' ' | Should -Match 'BitLocker'
+        (Test-Preflight -Facts (New-TestFacts @{ BitLockerProtected = $true; BitLockerKeyConfirmed = $true })).Errors.Count | Should -Be 0
+    }
+}
+
+Describe 'Format-Size' {
+    It 'formats with invariant culture' {
+        Format-Size -Bytes ([long]1.5GB) | Should -Be '1.5 GB'
+        Format-Size -Bytes ([long]5MB) | Should -Be '5 MB'
+        Format-Size -Bytes 2048 | Should -Be '2 KB'
+    }
+}
+
+Describe 'Hide-Secrets' {
+    It 'masks known secrets and password arguments' {
+        $t = Hide-Secrets -Text 'wbadmin ... -password:Sekret1 oraz Sekret1 i /pass:abc' -Secrets @('Sekret1')
+        $t | Should -Not -Match 'Sekret1'
+        $t | Should -Match '-password:\*\*\*'
+        $t | Should -Match '/pass:\*\*\*'
+    }
+
+    It 'leaves ordinary text alone and handles empty input' {
+        Hide-Secrets -Text 'Wszystko w porządku' -Secrets @('Sekret1') | Should -Be 'Wszystko w porządku'
+        Hide-Secrets -Text '' | Should -Be ''
+    }
+
+    It 'ignores very short secrets so it does not mangle text' {
+        Hide-Secrets -Text 'ab cd' -Secrets @('a') | Should -Be 'ab cd'
+    }
+}
