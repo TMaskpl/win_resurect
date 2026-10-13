@@ -97,6 +97,7 @@ Describe 'Test-Preflight' {
                 IsAdmin = $true; HasWbadmin = $true; Volumes = @('C:'); Target = 'usb'; TargetFound = $true
                 TargetFileSystem = 'NTFS'; TargetIsSystemDisk = $false; TargetFreeBytes = [long]500GB; UsedBytes = [long]100GB
                 OnBattery = $false; BitLockerProtected = $false; BitLockerKeyConfirmed = $false
+                TargetIsSystemDrive = $false; TargetDiskUnknown = $false
             }
             foreach ($k in $Overrides.Keys) { $f[$k] = $Overrides[$k] }
             [pscustomobject]$f
@@ -131,6 +132,18 @@ Describe 'Test-Preflight' {
         $r = Test-Preflight -Facts (New-TestFacts @{ Target = 'smb'; TargetFound = $true; TargetFileSystem = ''; TargetFreeBytes = $null })
         $r.Errors.Count | Should -Be 0
         $r.Warnings -join ' ' | Should -Match 'wolnego miejsca'
+    }
+
+    It 'refuses the system drive as the USB target and warns when the target disk cannot be identified' {
+        (Test-Preflight -Facts (New-TestFacts @{ TargetIsSystemDrive = $true })).Errors -join ' ' | Should -Match 'systemow'
+        $r = Test-Preflight -Facts (New-TestFacts @{ TargetDiskUnknown = $true })
+        $r.Errors.Count | Should -Be 0
+        $r.Warnings -join ' ' | Should -Match 'fizyczn'
+    }
+
+    It 'reports a missing volume list instead of failing on empty input' {
+        @(Select-BackupVolumes -Volumes @()).Count | Should -Be 0
+        Get-UsedBytes -Volumes @() -Selected @() | Should -Be 0
     }
 
     It 'warns on battery' {
@@ -230,14 +243,22 @@ Describe 'Invoke-ResurectBackup' {
                 IsAdmin = $true; HasWbadmin = $true; Volumes = @('C:'); Target = 'usb'; TargetFound = $true
                 TargetFileSystem = 'NTFS'; TargetIsSystemDisk = $false; TargetFreeBytes = [long]500GB; UsedBytes = [long]100GB
                 OnBattery = $false; BitLockerProtected = $false; BitLockerKeyConfirmed = $false
+                TargetIsSystemDrive = $false; TargetDiskUnknown = $false
             }
             foreach ($k in $Overrides.Keys) { $f[$k] = $Overrides[$k] }
             [pscustomobject]$f
         }
+        function New-TestCredential([string]$User, [string]$Pass) {
+            New-Object System.Management.Automation.PSCredential($User, (ConvertTo-SecureString $Pass -AsPlainText -Force))
+        }
         function Invoke-Orch {
-            param($Params, $Facts, [string]$Password = '')
+            param($Params, $Facts, [string]$Pass = '', $Skipped = @())
+            $extra = @{}
+            if ($Pass) { $extra['Credential'] = New-TestCredential 'uzytkownik' $Pass }
             Invoke-ResurectBackup -Params $Params -Target $script:target -Facts $Facts -Volumes @('C:') -Runner $script:runner `
-                -Password $Password -ComputerName 'PC1' -Now ([datetime]'2026-10-13T09:40:00') -OsCaption 'Windows 11' -OsVersion '10.0' -VolumeInfo $script:vinfo
+                -Connector $script:connector -Disconnector $script:disconnector `
+                -ComputerName 'PC1' -Now ([datetime]'2026-10-13T09:40:00') -OsCaption 'Windows 11' -OsVersion '10.0' `
+                -VolumeInfo $script:vinfo -SkippedInfo $Skipped @extra
         }
     }
     BeforeEach {
@@ -245,6 +266,7 @@ Describe 'Invoke-ResurectBackup' {
         $script:imageRoot = Join-Path $script:root 'WindowsImageBackup'
         $script:target = [pscustomobject]@{ BackupTarget = 'E:'; DocDir = (Join-Path $script:root 'doc'); ImageRoot = $script:imageRoot; Leaf = 'PC1_x' }
         $script:calls = New-Object System.Collections.ArrayList
+        $script:seenPassword = $null
         $script:wbFail = $false; $script:netFail = $false; $script:pnpFail = $false; $script:noImage = $false
         $script:runner = {
             param($Exe, $ArgList)
@@ -258,8 +280,19 @@ Describe 'Invoke-ResurectBackup' {
                 return @{ ExitCode = 0; Output = @() }
             }
             if ($Exe -eq 'wbadmin' -and $ArgList[0] -eq 'get') { return @{ ExitCode = 0; Output = @('Identyfikator wersji: 10/13/2026-09:40') } }
-            if ($Exe -eq 'net' -and $script:netFail -and ($ArgList -notcontains '/delete')) { return @{ ExitCode = 2; Output = @('Błąd systemu 53') } }
             if ($Exe -eq 'pnputil' -and $script:pnpFail) { return @{ ExitCode = 1; Output = @() } }
+            return @{ ExitCode = 0; Output = @() }
+        }
+        $script:connector = {
+            param($Share, $User, $Password)
+            $script:calls.Add("connect $Share $User") | Out-Null
+            $script:seenPassword = $Password
+            if ($script:netFail) { return @{ ExitCode = 53; Output = @('Błąd systemu 53') } }
+            return @{ ExitCode = 0; Output = @() }
+        }
+        $script:disconnector = {
+            param($Share)
+            $script:calls.Add("disconnect $Share") | Out-Null
             return @{ ExitCode = 0; Output = @() }
         }
         $script:vinfo = @([pscustomobject]@{ Drive = 'C:'; Used = [long]1GB })
@@ -277,12 +310,15 @@ Describe 'Invoke-ResurectBackup' {
         Test-Path (Join-Path $script:target.DocDir 'drivers') | Should -BeTrue
     }
 
-    It 'connects to SMB, backs up, disconnects, and never leaks the password into files or messages' {
+    It 'connects to SMB through the connector, never through a command line, and never leaks the password' {
         $facts = New-OrchFacts @{ Target = 'smb'; TargetFileSystem = ''; TargetFreeBytes = $null }
         $r = Invoke-Orch $script:paramsSmb $facts 'Sekret1'
         $r.ExitCode | Should -Be 0
-        $script:calls[0] | Should -Be 'net use \\nas\share Sekret1 /user:uzytkownik'
-        $script:calls[-1] | Should -Be 'net use \\nas\share /delete'
+        $script:calls[0] | Should -Be 'connect \\nas\share uzytkownik'
+        $script:calls[-1] | Should -Be 'disconnect \\nas\share'
+        $script:seenPassword | Should -Be 'Sekret1'
+        (@($script:calls) -join "`n") | Should -Not -Match 'Sekret1'
+        (@($script:calls) -join "`n") | Should -Not -Match '(?m)^net '
         $all = (Get-ChildItem $script:target.DocDir -Recurse -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
         $all | Should -Not -Match 'Sekret1'
         ($r.Messages -join "`n") | Should -Not -Match 'Sekret1'
@@ -295,7 +331,7 @@ Describe 'Invoke-ResurectBackup' {
         Test-Path $script:target.DocDir | Should -BeFalse
     }
 
-    It 'requires a password for SMB' {
+    It 'requires credentials for SMB' {
         $facts = New-OrchFacts @{ Target = 'smb'; TargetFileSystem = ''; TargetFreeBytes = $null }
         $r = Invoke-Orch $script:paramsSmb $facts ''
         $r.ExitCode | Should -Be 2
@@ -309,6 +345,7 @@ Describe 'Invoke-ResurectBackup' {
         $r.ExitCode | Should -Be 2
         $script:calls.Count | Should -Be 1
         ($r.Messages -join "`n") | Should -Not -Match 'Sekret1'
+        ($r.Messages -join "`n") | Should -Match '53'
         Test-Path $script:target.DocDir | Should -BeFalse
     }
 
@@ -322,7 +359,7 @@ Describe 'Invoke-ResurectBackup' {
         $log | Should -Match 'brak miejsca'
         (Get-Content -LiteralPath (Join-Path $script:target.DocDir 'manifest.txt') -Raw) | Should -Match 'Wynik: BŁĄD'
         Test-Path (Join-Path $script:target.DocDir 'PRZYWRACANIE.txt') | Should -BeFalse
-        $script:calls[-1] | Should -Be 'net use \\nas\share /delete'
+        $script:calls[-1] | Should -Be 'disconnect \\nas\share'
     }
 
     It 'fails verification when no image file appears' {
@@ -332,11 +369,30 @@ Describe 'Invoke-ResurectBackup' {
         Test-Path (Join-Path $script:target.DocDir 'PRZYWRACANIE.txt') | Should -BeFalse
     }
 
+    It 'does not accept an image from an earlier visit as proof of the new copy' {
+        New-Item -ItemType Directory -Force -Path $script:imageRoot | Out-Null
+        $old = Join-Path $script:imageRoot 'stary.vhdx'
+        Set-Content -Path $old -Value 'x'
+        (Get-Item -LiteralPath $old).LastWriteTime = [datetime]'2020-01-01T00:00:00'
+        $script:noImage = $true
+        $r = Invoke-Orch $script:paramsUsb (New-OrchFacts)
+        $r.ExitCode | Should -Be 1
+        $r.Status | Should -Match 'weryfikacja'
+    }
+
     It 'treats a driver export failure as a warning only' {
         $script:pnpFail = $true
         $r = Invoke-Orch $script:paramsUsb (New-OrchFacts)
         $r.ExitCode | Should -Be 0
         (Get-Content -LiteralPath (Join-Path $script:target.DocDir 'log.txt') -Raw) | Should -Match 'sterowników'
+    }
+
+    It 'records skipped volumes in the log and the manifest' {
+        $skipped = @([pscustomobject]@{ Drive = 'D:'; Reason = 'zablokowany BitLocker' })
+        $r = Invoke-Orch $script:paramsUsb (New-OrchFacts) '' $skipped
+        $r.ExitCode | Should -Be 0
+        (Get-Content -LiteralPath (Join-Path $script:target.DocDir 'log.txt') -Raw) | Should -Match 'D:.*zablokowany BitLocker'
+        (Get-Content -LiteralPath (Join-Path $script:target.DocDir 'manifest.txt') -Raw) | Should -Match 'Pominięte woluminy'
     }
 }
 
@@ -358,5 +414,102 @@ Describe 'script encoding' {
         $text = [System.Text.Encoding]::ASCII.GetString($bytes)
         ($text -split "`n").Count | Should -BeGreaterThan 5
         $text | Should -Not -Match "[^\r]\n"
+    }
+}
+
+
+Describe 'tool version and entry script' {
+    It 'exposes the tool version through a function (module variables are private)' {
+        Get-ToolVersion | Should -Match '^\d+\.\d+\.\d+$'
+    }
+
+    It 'starts under StrictMode and rejects bad input with exit code 2 (run as a file)' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        Push-Location $root
+        try {
+            & $pwsh -NoProfile -File (Join-Path $root 'Invoke-Resurect.ps1') -Target usb -Drive EE *> $null
+            $LASTEXITCODE | Should -Be 2
+        }
+        finally { Pop-Location }
+    }
+
+    It 'also works when the script text is loaded as a scriptblock from the tool folder (GPO workaround)' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        Push-Location $root
+        try {
+            & $pwsh -NoProfile -Command "& ([scriptblock]::Create((Get-Content -Raw .\Invoke-Resurect.ps1))) -Target usb -Drive EE" *> $null
+            $LASTEXITCODE | Should -Be 2
+        }
+        finally { Pop-Location }
+    }
+}
+
+Describe 'Start.cmd' {
+    BeforeAll { $script:cmd = Get-Content -LiteralPath (Join-Path (Split-Path $PSScriptRoot -Parent) 'Start.cmd') -Raw }
+
+    It 'elevates without passing an empty argument list and without quoting paths into the command string' {
+        $script:cmd | Should -Match 'if "%~1"==""'
+        $script:cmd | Should -Match 'WINRES_SELF'
+        $script:cmd | Should -Match 'WINRES_ARGS'
+        $script:cmd | Should -Not -Match "-FilePath '%~f0'"
+    }
+}
+
+Describe 'BitLocker state' {
+    It 'treats active, suspended, in-progress and partially encrypted volumes as encrypted' {
+        ConvertTo-BitLockerState -ProtectionStatus 1 -EncryptionPercentage 100 -VolumeStatus 'FullyEncrypted' | Should -Be 'On'
+        ConvertTo-BitLockerState -ProtectionStatus 0 -EncryptionPercentage 100 -VolumeStatus 'FullyEncrypted' | Should -Be 'On'
+        ConvertTo-BitLockerState -ProtectionStatus 0 -EncryptionPercentage 40 -VolumeStatus 'EncryptionInProgress' | Should -Be 'On'
+    }
+
+    It 'reports a decrypted volume as off' {
+        ConvertTo-BitLockerState -ProtectionStatus 0 -EncryptionPercentage 0 -VolumeStatus 'FullyDecrypted' | Should -Be 'Off'
+    }
+}
+
+Describe 'share root and skipped volumes' {
+    It 'reduces a share path to its root' {
+        Get-ShareRoot -Share '\\nas\share\katalog\pod' | Should -Be '\\nas\share'
+        Get-ShareRoot -Share '\\nas\share' | Should -Be '\\nas\share'
+    }
+
+    It 'lists skipped volumes with a reason, except selected ones and the target' {
+        $vols = @(
+            [pscustomobject]@{ Drive = 'C:'; FileSystem = 'NTFS'; DriveType = 3; Size = [long]1GB; Free = [long]0; Used = [long]1GB },
+            [pscustomobject]@{ Drive = 'D:'; FileSystem = ''; DriveType = 3; Size = [long]0; Free = [long]0; Used = [long]0 },
+            [pscustomobject]@{ Drive = 'F:'; FileSystem = 'ReFS'; DriveType = 3; Size = [long]1GB; Free = [long]0; Used = [long]1GB },
+            [pscustomobject]@{ Drive = 'G:'; FileSystem = 'NTFS'; DriveType = 2; Size = [long]1GB; Free = [long]0; Used = [long]1GB },
+            [pscustomobject]@{ Drive = 'E:'; FileSystem = 'NTFS'; DriveType = 3; Size = [long]1GB; Free = [long]0; Used = [long]1GB }
+        )
+        $s = @(Get-SkippedVolumes -Volumes $vols -Selected @('C:') -TargetDrive 'E:')
+        @($s | ForEach-Object { $_.Drive }) | Should -Be @('D:', 'F:', 'G:')
+        ($s | Where-Object { $_.Drive -eq 'D:' }).Reason | Should -Match 'BitLocker'
+        ($s | Where-Object { $_.Drive -eq 'F:' }).Reason | Should -Match 'ReFS'
+        ($s | Where-Object { $_.Drive -eq 'G:' }).Reason | Should -Match 'wymienn'
+    }
+
+    It 'shows skipped volumes in the manifest' {
+        $i = [pscustomobject]@{
+            ToolVersion = '0.1.0'; ComputerName = 'PC1'; OsCaption = 'Windows'; OsVersion = '10'; Date = [datetime]'2026-10-13T09:40:00'
+            Target = 'usb'; Drive = 'E:'; BackupTarget = 'E:'; Status = 'OK'; DurationSec = 1; BitLocker = $false
+            Volumes = @(); Skipped = @([pscustomobject]@{ Drive = 'D:'; Reason = 'zablokowany BitLocker' })
+        }
+        (New-Manifest -Info $i) | Should -Match 'Pominięte woluminy:\s+D:.*zablokowany BitLocker'
+    }
+}
+
+Describe 'fresh image check' {
+    It 'ignores image files older than the given time' {
+        $root = Join-Path $TestDrive 'fresh'
+        New-Item -ItemType Directory -Path $root | Out-Null
+        $f = Join-Path $root 'stary.vhdx'
+        Set-Content -Path $f -Value 'x'
+        (Get-Item -LiteralPath $f).LastWriteTime = [datetime]'2020-01-01T00:00:00'
+        Test-ImageFilePresent -Root $root | Should -BeTrue
+        Test-ImageFilePresent -Root $root -NotOlderThan ([datetime]'2026-01-01') | Should -BeFalse
+        Set-Content -Path (Join-Path $root 'nowy.vhdx') -Value 'x'
+        Test-ImageFilePresent -Root $root -NotOlderThan ([datetime]'2026-01-01') | Should -BeTrue
     }
 }

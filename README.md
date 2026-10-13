@@ -39,7 +39,11 @@ Start.cmd -Target smb -Share \\nas\share -User uzytkownik
 | `-Folder nazwa` | podfolder na nośniku (domyślnie `WinResurect`; litery, cyfry, `.`, `-`, `_`) |
 | `-Yes` | pomija pytania o potwierdzenie (nie dotyczy BitLockera) |
 
-**Hasło SMB** podajesz po zachęcie (nie jest widoczne) albo przez zmienną `WINRES_PASSWORD` ustawioną tylko na czas uruchomienia. Nigdy nie wpisuj hasła w parametrach ani w plikach.
+**Hasło SMB** podajesz po zachęcie (nie jest widoczne). To zalecany sposób: hasło nie trafia do historii poleceń, do wiersza poleceń żadnego procesu ani do logów. Hasło jest przekazywane do Windows jako `SecureString` i przez interfejs sieciowy systemu (`WNetAddConnection2`), a nie przez `net use`.
+
+Zmienna `WINRES_PASSWORD` jest tylko awaryjną opcją dla uruchomień bez nadzoru. **Nie ustawiaj jej w PowerShellu** (zapisze hasło w historii poleceń PSReadLine). Jeśli musisz, ustaw ją w `cmd` (`set WINRES_PASSWORD=...`) w oknie uruchomionym już jako administrator, bo po podniesieniu uprawnień zmienna może nie zostać przekazana. Nigdy nie wpisuj hasła w parametrach ani w plikach.
+
+Uruchamiaj narzędzie z dysku lokalnego (np. `C:\win_resurect`). Po podniesieniu uprawnień (UAC) dyski sieciowe zmapowane w sesji użytkownika znikają.
 
 ## Co robi narzędzie
 
@@ -49,7 +53,7 @@ Start.cmd -Target smb -Share \\nas\share -User uzytkownik
 4. Tworzy obraz wszystkich lokalnych dysków NTFS (`wbadmin ... -allCritical`).
 5. Weryfikuje kopię (lista wersji i obecność pliku obrazu).
 6. Zapisuje na nośniku folder `WinResurect\<komputer>_<data>` z plikami `manifest.txt`, `log.txt`, `PRZYWRACANIE.txt` i `drivers\`.
-7. Odłącza udział i czyści hasło z pamięci.
+7. Odłącza udział i usuwa referencję do hasła (hasło było tylko w pamięci procesu).
 
 Kody wyjścia: `0` sukces, `1` błąd kopii, `2` nie spełniono warunków przed startem, `3` przerwanie.
 
@@ -68,7 +72,7 @@ Pełna instrukcja jest w [`docs/PRZYWRACANIE.md`](docs/PRZYWRACANIE.md) i w plik
 
 | Objaw | Co zrobić |
 |---|---|
-| „Running scripts is disabled” | Uruchom `Start.cmd` (ma `-ExecutionPolicy Bypass`). Jeśli politykę narzuca GPO i `Start.cmd` nadal się nie uruchamia, otwórz PowerShell jako administrator w katalogu narzędzia i wykonaj dwa polecenia: `Get-Content -Raw .\src\WinResurect.psm1 \| Invoke-Expression`, a potem `Get-Content -Raw .\Invoke-Resurect.ps1 \| Invoke-Expression` |
+| „Running scripts is disabled” | Uruchom `Start.cmd` (ma `-ExecutionPolicy Bypass`). Jeśli politykę narzuca GPO i `Start.cmd` nadal się nie uruchamia, otwórz wiersz poleceń jako administrator, przejdź do katalogu narzędzia (`cd /d C:\win_resurect`) i uruchom: `powershell -NoProfile -Command "& ([scriptblock]::Create((Get-Content -Raw .\Invoke-Resurect.ps1))) -Target usb -Drive E:"` (parametry jak w `Start.cmd`). To działa, bo polityka dotyczy plików skryptów, a nie poleceń |
 | „Za mało miejsca na celu” | Użyj większego dysku albo zwolnij miejsce |
 | „Dysk USB musi być w NTFS” | Sformatuj dysk w NTFS (utracisz jego zawartość) |
 | Błąd połączenia z udziałem | Sprawdź adres, użytkownika, hasło i dostęp do sieci; przetestuj `net use` ręcznie |

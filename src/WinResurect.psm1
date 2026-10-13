@@ -2,6 +2,8 @@
 
 $script:ToolVersion = '0.1.0'
 
+function Get-ToolVersion { return $script:ToolVersion }
+
 function Test-ResurectParams {
     [CmdletBinding()]
     param(
@@ -58,7 +60,7 @@ function Get-WbadminArgs {
 }
 
 function Select-BackupVolumes {
-    param([Parameter(Mandatory)][object[]]$Volumes, [string]$TargetDrive = '')
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Volumes, [string]$TargetDrive = '')
     $skip = if ($TargetDrive) { $TargetDrive.Substring(0, 1).ToUpper() } else { '' }
     $picked = @($Volumes | Where-Object {
             $_.FileSystem -eq 'NTFS' -and $_.DriveType -eq 3 -and $_.Drive.Substring(0, 1).ToUpper() -ne $skip
@@ -67,7 +69,7 @@ function Select-BackupVolumes {
 }
 
 function Get-UsedBytes {
-    param([Parameter(Mandatory)][object[]]$Volumes, [Parameter(Mandatory)][string[]]$Selected)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Volumes, [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Selected)
     $sum = [long]0
     foreach ($v in $Volumes) {
         if ($Selected -contains ($v.Drive.Substring(0, 1).ToUpper() + ':')) { $sum += [long]$v.Used }
@@ -104,6 +106,8 @@ function Test-Preflight {
         if (-not $Facts.TargetFound) { [void]$errors.Add('Nie znaleziono dysku docelowego USB (sprawdź literę dysku).') }
         elseif ($Facts.TargetFileSystem -ne 'NTFS') { [void]$errors.Add("Dysk USB musi być w NTFS (jest: '$($Facts.TargetFileSystem)').") }
         if ($Facts.TargetIsSystemDisk) { [void]$errors.Add('Cel leży na tym samym fizycznym dysku, co kopiowany system.') }
+        if ($Facts.TargetIsSystemDrive) { [void]$errors.Add('Cel nie może być dyskiem systemowym.') }
+        if ($Facts.TargetDiskUnknown) { [void]$warnings.Add('Nie można ustalić fizycznego dysku celu - upewnij się, że nie jest to ten sam dysk, co kopiowany system.') }
     }
     $need = [long]($Facts.UsedBytes * 1.1)
     if ($null -eq $Facts.TargetFreeBytes) {
@@ -114,7 +118,7 @@ function Test-Preflight {
     }
     if ($Facts.OnBattery) { [void]$warnings.Add('Komputer pracuje na baterii — podłącz zasilanie.') }
     if ($Facts.BitLockerProtected -and -not $Facts.BitLockerKeyConfirmed) {
-        [void]$errors.Add('BitLocker włączony: potwierdź, że klucz odzyskiwania jest zapisany poza tą kopią.')
+        [void]$errors.Add('BitLocker włączony (lub nie udało się ustalić stanu): potwierdź, że klucz odzyskiwania jest zapisany poza tą kopią.')
     }
     return [pscustomobject]@{ Errors = @($errors); Warnings = @($warnings) }
 }
@@ -136,6 +140,11 @@ function New-Manifest {
         'Woluminy:'
     )
     foreach ($v in $Info.Volumes) { $lines += "  $($v.Drive)  użyte: $(Format-Size ([long]$v.Used))" }
+    $skipped = @(if ($Info.PSObject.Properties['Skipped']) { $Info.Skipped })
+    if ($skipped.Count -gt 0) {
+        $lines += 'Pominięte woluminy:'
+        foreach ($sv in $skipped) { $lines += "  $($sv.Drive)  $($sv.Reason) - NIE ma w kopii" }
+    }
     return ($lines -join "`r`n") + "`r`n"
 }
 
@@ -177,12 +186,95 @@ function New-RestoreInstructions {
 }
 
 function Test-ImageFilePresent {
-    param([Parameter(Mandatory)][string]$Root)
+    param([Parameter(Mandatory)][string]$Root, [datetime]$NotOlderThan = [datetime]::MinValue)
     if (-not (Test-Path -LiteralPath $Root)) { return $false }
     $f = @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
-            Where-Object { ($_.Extension -eq '.vhdx' -or $_.Extension -eq '.vhd') -and $_.Length -gt 0 })
+            Where-Object { ($_.Extension -eq '.vhdx' -or $_.Extension -eq '.vhd') -and $_.Length -gt 0 -and $_.LastWriteTime -ge $NotOlderThan })
     return ($f.Count -gt 0)
 }
+
+function ConvertTo-BitLockerState {
+    param($ProtectionStatus, $EncryptionPercentage, [string]$VolumeStatus)
+    if ($null -ne $ProtectionStatus -and [int]$ProtectionStatus -eq 1) { return 'On' }
+    if ($null -ne $EncryptionPercentage -and [int]$EncryptionPercentage -gt 0) { return 'On' }
+    if ($VolumeStatus -and $VolumeStatus -ne 'FullyDecrypted') { return 'On' }
+    return 'Off'
+}
+
+function Get-ShareRoot {
+    param([Parameter(Mandatory)][string]$Share)
+    if ($Share -match '^(\\\\[^\\]+\\[^\\]+)') { return $Matches[1] }
+    return $Share
+}
+
+function Get-SkippedVolumes {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Volumes,
+        [AllowEmptyCollection()][string[]]$Selected = @(),
+        [string]$TargetDrive = ''
+    )
+    $target = if ($TargetDrive) { $TargetDrive.Substring(0, 1).ToUpper() + ':' } else { '' }
+    $out = @()
+    foreach ($v in $Volumes) {
+        $d = $v.Drive.Substring(0, 1).ToUpper() + ':'
+        if (($Selected -contains $d) -or $d -eq $target) { continue }
+        if ($v.DriveType -ne 3) { $reason = 'dysk wymienny lub inny typ nośnika' }
+        elseif (-not $v.FileSystem) { $reason = 'nieznany system plików lub wolumin zablokowany (BitLocker)' }
+        else { $reason = "system plików $($v.FileSystem) (kopiowany jest tylko NTFS)" }
+        $out += [pscustomobject]@{ Drive = $d; Reason = $reason }
+    }
+    return $out
+}
+
+function Get-NetworkErrorText {
+    param([Parameter(Mandatory)][int]$Code)
+    switch ($Code) {
+        0 { return 'OK' }
+        5 { return 'odmowa dostępu' }
+        53 { return 'nie znaleziono ścieżki sieciowej' }
+        86 { return 'błędne hasło' }
+        1219 { return 'istnieje już połączenie z tym serwerem na innych poświadczeniach (odłącz je poleceniem: net use <udział> /delete)' }
+        1326 { return 'błędny użytkownik lub hasło' }
+        default { return "błąd Windows $Code" }
+    }
+}
+
+$script:NativeSource = @'
+using System;
+using System.Runtime.InteropServices;
+namespace WinResurect {
+    public static class Native {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct NETRESOURCE {
+            public int dwScope; public int dwType; public int dwDisplayType; public int dwUsage;
+            public string lpLocalName; public string lpRemoteName; public string lpComment; public string lpProvider;
+        }
+        [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+        public static extern int WNetAddConnection2(ref NETRESOURCE r, string password, string username, int flags);
+        [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+        public static extern int WNetCancelConnection2(string name, int flags, bool force);
+    }
+}
+'@
+
+function Connect-NetworkShare {
+    # Hasło trafia do WinAPI, a nie do wiersza poleceń żadnego procesu.
+    param([Parameter(Mandatory)][string]$Share, [Parameter(Mandatory)][string]$User, [Parameter(Mandatory)][string]$Password)
+    if (-not ('WinResurect.Native' -as [type])) { Add-Type -TypeDefinition $script:NativeSource }
+    $r = New-Object WinResurect.Native+NETRESOURCE
+    $r.dwType = 1
+    $r.lpRemoteName = $Share
+    $rc = [WinResurect.Native]::WNetAddConnection2([ref]$r, $Password, $User, 0)
+    return @{ ExitCode = [int]$rc; Output = @(Get-NetworkErrorText -Code ([int]$rc)) }
+}
+
+function Disconnect-NetworkShare {
+    param([Parameter(Mandatory)][string]$Share)
+    if (-not ('WinResurect.Native' -as [type])) { Add-Type -TypeDefinition $script:NativeSource }
+    $rc = [WinResurect.Native]::WNetCancelConnection2($Share, 0, $true)
+    return @{ ExitCode = [int]$rc; Output = @(Get-NetworkErrorText -Code ([int]$rc)) }
+}
+
 
 function Invoke-ResurectBackup {
     param(
@@ -191,15 +283,20 @@ function Invoke-ResurectBackup {
         [Parameter(Mandatory)]$Facts,
         [Parameter(Mandatory)][string[]]$Volumes,
         [Parameter(Mandatory)][scriptblock]$Runner,
-        [string]$Password = '',
+        [System.Management.Automation.PSCredential]$Credential = $null,
+        [scriptblock]$Connector = { param($Share, $User, $Password) Connect-NetworkShare -Share $Share -User $User -Password $Password },
+        [scriptblock]$Disconnector = { param($Share) Disconnect-NetworkShare -Share $Share },
         [string]$ComputerName = $env:COMPUTERNAME,
         [datetime]$Now = (Get-Date),
         [string]$OsCaption = '',
         [string]$OsVersion = '',
-        [object[]]$VolumeInfo = @()
+        [object[]]$VolumeInfo = @(),
+        [object[]]$SkippedInfo = @()
     )
+    $plain = if ($Credential) { $Credential.GetNetworkCredential().Password } else { '' }
+    $shareRoot = if ($Params.Target -eq 'smb') { Get-ShareRoot -Share $Params.Share } else { '' }
     $log = New-Object System.Collections.ArrayList
-    $secrets = @($Password)
+    $secrets = @($plain)
     $say = { param($m) [void]$log.Add((Hide-Secrets -Text $m -Secrets $secrets)) }
     $started = Get-Date
     $code = 0
@@ -209,21 +306,23 @@ function Invoke-ResurectBackup {
     try {
         $pf = Test-Preflight -Facts $Facts
         foreach ($w in $pf.Warnings) { & $say "Ostrzeżenie: $w" }
+        foreach ($sv in @($SkippedInfo)) { & $say "Ostrzeżenie: pominięto wolumin $($sv.Drive) - $($sv.Reason)" }
         if ($pf.Errors.Count -gt 0) {
             foreach ($e in $pf.Errors) { & $say "Błąd: $e" }
             $code = 2; $status = 'PRZERWANO (kontrole przed startem)'
         }
-        if ($code -eq 0 -and $smb -and -not $Password) {
-            & $say 'Błąd: podaj hasło do udziału SMB.'
+        if ($code -eq 0 -and $smb -and -not $plain) {
+            & $say 'Błąd: podaj użytkownika i hasło do udziału SMB.'
             $code = 2; $status = 'PRZERWANO (brak hasła)'
         }
         if ($code -eq 0 -and $smb) {
-            $c = & $Runner 'net' @('use', $Params.Share, $Password, "/user:$($Params.User)")
+            $c = & $Connector $shareRoot $Params.User $plain
             if ($c.ExitCode -ne 0) {
-                & $say 'Błąd: nie można połączyć się z udziałem SMB (sprawdź adres, użytkownika i hasło).'
+                $why = (@($c.Output) -join ' ')
+                & $say "Błąd: nie można połączyć się z udziałem SMB (kod $($c.ExitCode)): $why"
                 $code = 2; $status = 'PRZERWANO (brak połączenia z udziałem)'
             }
-            else { $connected = $true; & $say "Połączono z udziałem $($Params.Share)." }
+            else { $connected = $true; & $say "Połączono z udziałem $shareRoot." }
         }
         $driversDir = Join-Path $Target.DocDir 'drivers'
         if ($code -eq 0) {
@@ -250,7 +349,7 @@ function Invoke-ResurectBackup {
         if ($code -eq 0) {
             $v = & $Runner 'wbadmin' @('get', 'versions', "-backupTarget:$($Target.BackupTarget)")
             $listed = ($v.ExitCode -eq 0) -and ((@($v.Output) -join "`n") -match '\d{1,2}/\d{1,2}/\d{4}-\d{1,2}:\d{2}')
-            $present = Test-ImageFilePresent -Root $Target.ImageRoot
+            $present = Test-ImageFilePresent -Root $Target.ImageRoot -NotOlderThan $started.AddMinutes(-15)
             if ($listed -and $present) { & $say 'Weryfikacja: kopia widoczna w wbadmin, plik obrazu istnieje.' }
             else {
                 & $say 'Błąd: weryfikacja kopii nie powiodła się (brak wersji w wbadmin lub brak pliku obrazu).'
@@ -263,7 +362,7 @@ function Invoke-ResurectBackup {
                     ToolVersion = $script:ToolVersion; ComputerName = $ComputerName; OsCaption = $OsCaption; OsVersion = $OsVersion
                     Date = $Now; Target = $Params.Target; Drive = $Params.Drive; BackupTarget = $Target.BackupTarget
                     Status = $status; DurationSec = ((Get-Date) - $started).TotalSeconds
-                    Volumes = @($VolumeInfo); BitLocker = [bool]$Facts.BitLockerProtected
+                    Volumes = @($VolumeInfo); Skipped = @($SkippedInfo); BitLocker = [bool]$Facts.BitLockerProtected
                 }
                 Set-Content -LiteralPath (Join-Path $Target.DocDir 'manifest.txt') -Value (New-Manifest -Info $info) -Encoding UTF8
                 if ($code -eq 0) {
@@ -276,22 +375,24 @@ function Invoke-ResurectBackup {
     }
     finally {
         if ($connected) {
-            try { & $Runner 'net' @('use', $Params.Share, '/delete') | Out-Null; & $say 'Odłączono udział.' } catch { }
+            try { & $Disconnector $shareRoot | Out-Null; & $say 'Odłączono udział.' } catch { }
         }
     }
     return [pscustomobject]@{ ExitCode = $code; Status = $status; DocDir = $Target.DocDir; Messages = @($log) }
 }
 
 function Get-LocalVolumes {
-    $disks = @(Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { ($_.DriveType -eq 2 -or $_.DriveType -eq 3) -and $_.Size })
+    $disks = @(Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DriveType -eq 2 -or $_.DriveType -eq 3 })
     foreach ($d in $disks) {
+        $size = [long]$d.Size
+        $free = [long]$d.FreeSpace
         [pscustomobject]@{
             Drive      = [string]$d.DeviceID
             FileSystem = [string]$d.FileSystem
             DriveType  = [int]$d.DriveType
-            Size       = [long]$d.Size
-            Free       = [long]$d.FreeSpace
-            Used       = [long]($d.Size - $d.FreeSpace)
+            Size       = $size
+            Free       = $free
+            Used       = [long]($size - $free)
         }
     }
 }
@@ -303,20 +404,25 @@ function Get-DiskNumber {
 }
 
 function Test-BitLockerProtected {
-    param([Parameter(Mandatory)][string[]]$Volumes)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Volumes)
     foreach ($v in $Volumes) {
+        $state = 'Unknown'
         try {
             $s = Get-BitLockerVolume -MountPoint $v -ErrorAction Stop
-            if ([int]$s.ProtectionStatus -eq 1) { return $true }
-            continue
+            $state = ConvertTo-BitLockerState -ProtectionStatus ([int]$s.ProtectionStatus) -EncryptionPercentage $s.EncryptionPercentage -VolumeStatus ([string]$s.VolumeStatus)
         }
-        catch { }
-        try {
-            $ev = Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$v'" -ErrorAction Stop
-            $res = Invoke-CimMethod -InputObject $ev -MethodName GetProtectionStatus -ErrorAction Stop
-            if ([int]$res.ProtectionStatus -eq 1) { return $true }
+        catch {
+            try {
+                $ev = Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$v'" -ErrorAction Stop
+                $ps = [int](Invoke-CimMethod -InputObject $ev -MethodName GetProtectionStatus -ErrorAction Stop).ProtectionStatus
+                $cs = Invoke-CimMethod -InputObject $ev -MethodName GetConversionStatus -ErrorAction Stop
+                $vs = if ([int]$cs.ConversionStatus -eq 0) { 'FullyDecrypted' } else { 'Encrypted' }
+                $state = ConvertTo-BitLockerState -ProtectionStatus $ps -EncryptionPercentage ([int]$cs.EncryptionPercentage) -VolumeStatus $vs
+            }
+            catch { $state = 'Unknown' }
         }
-        catch { }
+        # 'Unknown' traktujemy jak szyfrowany: lepiej zapytać o klucz niż założyć, że go nie trzeba.
+        if ($state -ne 'Off') { return $true }
     }
     return $false
 }
@@ -328,14 +434,16 @@ function Test-OnBattery {
 }
 
 function Get-ResurectFacts {
-    param([Parameter(Mandatory)]$Params, [Parameter(Mandatory)][object[]]$AllVolumes, [Parameter(Mandatory)][string[]]$Selected)
+    param([Parameter(Mandatory)]$Params, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AllVolumes, [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Selected)
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    $found = $true; $fs = ''; $free = $null; $sameDisk = $false
+    $found = $true; $fs = ''; $free = $null; $sameDisk = $false; $isSystemDrive = $false; $diskUnknown = $false
     if ($Params.Target -eq 'usb') {
         $tv = $AllVolumes | Where-Object { $_.Drive -eq $Params.Drive } | Select-Object -First 1
         if ($tv) { $fs = $tv.FileSystem; $free = [long]$tv.Free } else { $found = $false }
+        $isSystemDrive = ($Params.Drive -eq "$env:SystemDrive".ToUpper())
         $targetDisk = Get-DiskNumber -Drive $Params.Drive
-        if ($null -ne $targetDisk) {
+        if ($null -eq $targetDisk) { $diskUnknown = $true }
+        else {
             foreach ($s in $Selected) { if ((Get-DiskNumber -Drive $s) -eq $targetDisk) { $sameDisk = $true } }
         }
     }
@@ -352,5 +460,7 @@ function Get-ResurectFacts {
         OnBattery             = (Test-OnBattery)
         BitLockerProtected    = (Test-BitLockerProtected -Volumes $Selected)
         BitLockerKeyConfirmed = $false
+        TargetIsSystemDrive   = $isSystemDrive
+        TargetDiskUnknown     = $diskUnknown
     }
 }
