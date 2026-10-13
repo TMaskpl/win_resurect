@@ -339,3 +339,24 @@ Describe 'Invoke-ResurectBackup' {
         (Get-Content -LiteralPath (Join-Path $script:target.DocDir 'log.txt') -Raw) | Should -Match 'sterowników'
     }
 }
+
+Describe 'script encoding' {
+    It 'keeps PowerShell sources as UTF-8 with BOM so Windows PowerShell 5.1 reads Polish text correctly' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Include *.ps1, *.psm1 |
+                Where-Object { $_.FullName -notmatch '[\\/]tests[\\/]' })
+        $files.Count | Should -BeGreaterThan 1
+        foreach ($f in $files) {
+            $b = [System.IO.File]::ReadAllBytes($f.FullName)
+            ('{0:X2}{1:X2}{2:X2}' -f $b[0], $b[1], $b[2]) | Should -Be 'EFBBBF' -Because "$($f.Name) musi mieć BOM UTF-8"
+        }
+    }
+
+    It 'keeps Start.cmd ASCII-only with CRLF line endings' {
+        $bytes = [System.IO.File]::ReadAllBytes((Join-Path (Split-Path $PSScriptRoot -Parent) 'Start.cmd'))
+        @($bytes | Where-Object { $_ -gt 127 }).Count | Should -Be 0
+        $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+        ($text -split "`n").Count | Should -BeGreaterThan 5
+        $text | Should -Not -Match "[^\r]\n"
+    }
+}

@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 $script:ToolVersion = '0.1.0'
 
@@ -280,4 +280,77 @@ function Invoke-ResurectBackup {
         }
     }
     return [pscustomobject]@{ ExitCode = $code; Status = $status; DocDir = $Target.DocDir; Messages = @($log) }
+}
+
+function Get-LocalVolumes {
+    $disks = @(Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { ($_.DriveType -eq 2 -or $_.DriveType -eq 3) -and $_.Size })
+    foreach ($d in $disks) {
+        [pscustomobject]@{
+            Drive      = [string]$d.DeviceID
+            FileSystem = [string]$d.FileSystem
+            DriveType  = [int]$d.DriveType
+            Size       = [long]$d.Size
+            Free       = [long]$d.FreeSpace
+            Used       = [long]($d.Size - $d.FreeSpace)
+        }
+    }
+}
+
+function Get-DiskNumber {
+    param([Parameter(Mandatory)][string]$Drive)
+    try { return [int](Get-Partition -DriveLetter $Drive.Substring(0, 1) -ErrorAction Stop | Get-Disk).Number }
+    catch { return $null }
+}
+
+function Test-BitLockerProtected {
+    param([Parameter(Mandatory)][string[]]$Volumes)
+    foreach ($v in $Volumes) {
+        try {
+            $s = Get-BitLockerVolume -MountPoint $v -ErrorAction Stop
+            if ([int]$s.ProtectionStatus -eq 1) { return $true }
+            continue
+        }
+        catch { }
+        try {
+            $ev = Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$v'" -ErrorAction Stop
+            $res = Invoke-CimMethod -InputObject $ev -MethodName GetProtectionStatus -ErrorAction Stop
+            if ([int]$res.ProtectionStatus -eq 1) { return $true }
+        }
+        catch { }
+    }
+    return $false
+}
+
+function Test-OnBattery {
+    $b = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+    if ($b.Count -eq 0) { return $false }
+    return (@($b | Where-Object { $_.BatteryStatus -eq 1 }).Count -gt 0)
+}
+
+function Get-ResurectFacts {
+    param([Parameter(Mandatory)]$Params, [Parameter(Mandatory)][object[]]$AllVolumes, [Parameter(Mandatory)][string[]]$Selected)
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $found = $true; $fs = ''; $free = $null; $sameDisk = $false
+    if ($Params.Target -eq 'usb') {
+        $tv = $AllVolumes | Where-Object { $_.Drive -eq $Params.Drive } | Select-Object -First 1
+        if ($tv) { $fs = $tv.FileSystem; $free = [long]$tv.Free } else { $found = $false }
+        $targetDisk = Get-DiskNumber -Drive $Params.Drive
+        if ($null -ne $targetDisk) {
+            foreach ($s in $Selected) { if ((Get-DiskNumber -Drive $s) -eq $targetDisk) { $sameDisk = $true } }
+        }
+    }
+    return [pscustomobject]@{
+        IsAdmin               = [bool]$isAdmin
+        HasWbadmin            = [bool](Get-Command wbadmin.exe -ErrorAction SilentlyContinue)
+        Volumes               = @($Selected)
+        Target                = $Params.Target
+        TargetFound           = $found
+        TargetFileSystem      = $fs
+        TargetIsSystemDisk    = $sameDisk
+        TargetFreeBytes       = $free
+        UsedBytes             = (Get-UsedBytes -Volumes $AllVolumes -Selected $Selected)
+        OnBattery             = (Test-OnBattery)
+        BitLockerProtected    = (Test-BitLockerProtected -Volumes $Selected)
+        BitLockerKeyConfirmed = $false
+    }
 }
