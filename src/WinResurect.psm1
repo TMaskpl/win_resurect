@@ -118,3 +118,68 @@ function Test-Preflight {
     }
     return [pscustomobject]@{ Errors = @($errors); Warnings = @($warnings) }
 }
+
+function New-Manifest {
+    param([Parameter(Mandatory)]$Info)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $bl = if ($Info.BitLocker) { 'tak (klucz nie jest zapisywany na nośniku z kopią)' } else { 'nie' }
+    $lines = @(
+        'win_resurect - manifest kopii',
+        "Wersja narzędzia: $($Info.ToolVersion)",
+        "Komputer: $($Info.ComputerName)",
+        "System: $($Info.OsCaption) ($($Info.OsVersion))",
+        "Data: $($Info.Date.ToString('yyyy-MM-dd HH:mm', $inv))",
+        "Cel: $($Info.Target) - $($Info.BackupTarget)",
+        "Wynik: $($Info.Status)",
+        "Czas: $([int]$Info.DurationSec) s",
+        "BitLocker: $bl",
+        'Woluminy:'
+    )
+    foreach ($v in $Info.Volumes) { $lines += "  $($v.Drive)  użyte: $(Format-Size ([long]$v.Used))" }
+    return ($lines -join "`r`n") + "`r`n"
+}
+
+function New-RestoreInstructions {
+    param([Parameter(Mandatory)]$Info)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Info.Target -eq 'usb') {
+        $where = "dysk USB $($Info.Drive), katalog główny, folder WindowsImageBackup\$($Info.ComputerName)"
+        $pick = 'Wybierz obraz systemu (dysk USB powinien być widoczny na liście).'
+    }
+    else {
+        $where = "udział $($Info.BackupTarget), folder WindowsImageBackup\$($Info.ComputerName)"
+        $pick = "Wybierz: Zaawansowane -> Wyszukaj obraz systemu w sieci i podaj ścieżkę $($Info.BackupTarget) oraz dane dostępu do udziału."
+    }
+    $lines = @(
+        "PRZYWRACANIE - kopia komputera $($Info.ComputerName) z $($Info.Date.ToString('yyyy-MM-dd HH:mm', $inv))",
+        '',
+        "Gdzie leży kopia: $where",
+        '',
+        'PEŁNE ODTWORZENIE (nadpisze dysk komputera!)',
+        '1. Podłącz nośnik z kopią (USB) albo upewnij się, że udział sieciowy jest dostępny.',
+        '2. Uruchom środowisko odzyskiwania: Ustawienia -> System -> Odzyskiwanie -> Uruchamianie zaawansowane -> Uruchom ponownie teraz',
+        '   (albo uruchom z pendrive''a instalacyjnego Windows i wybierz Napraw komputer).',
+        '3. Rozwiązywanie problemów -> Opcje zaawansowane -> Więcej opcji odzyskiwania -> Odzyskiwanie obrazu systemu.',
+        "4. $pick",
+        '5. Jeśli dysk był szyfrowany BitLockerem, przygotuj klucz odzyskiwania BitLocker (nie jest zapisany na tym nośniku).',
+        '6. Potwierdź odtworzenie i poczekaj na zakończenie. Komputer uruchomi się ponownie.',
+        '',
+        'POJEDYNCZE PLIKI (bez odtwarzania całości)',
+        '1. Znajdź plik .vhdx w folderze WindowsImageBackup\<komputer>\Backup <data>.',
+        '2. W PowerShellu jako administrator: Mount-DiskImage -ImagePath "<pełna ścieżka do .vhdx>" -Access ReadOnly',
+        '3. Skopiuj potrzebne pliki z nowego dysku, który pojawi się w Eksploratorze.',
+        '4. Odmontuj: Dismount-DiskImage -ImagePath "<pełna ścieżka do .vhdx>"',
+        '',
+        'UWAGI: odtwarzanie na innym sprzęcie nie jest gwarantowane; stare serwery plików wymagające SMB1 nie zostaną',
+        'zamontowane w środowisku odzyskiwania - użyj wtedy kopii na USB.'
+    )
+    return ($lines -join "`r`n") + "`r`n"
+}
+
+function Test-ImageFilePresent {
+    param([Parameter(Mandatory)][string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return $false }
+    $f = @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { ($_.Extension -eq '.vhdx' -or $_.Extension -eq '.vhd') -and $_.Length -gt 0 })
+    return ($f.Count -gt 0)
+}

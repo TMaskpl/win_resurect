@@ -169,3 +169,53 @@ Describe 'Hide-Secrets' {
         Hide-Secrets -Text 'ab cd' -Secrets @('a') | Should -Be 'ab cd'
     }
 }
+
+Describe 'documents' {
+    BeforeAll {
+        $script:info = [pscustomobject]@{
+            ToolVersion = '0.1.0'; ComputerName = 'PC1'; OsCaption = 'Microsoft Windows 11 Pro'; OsVersion = '10.0.26100'
+            Date = [datetime]'2026-10-13T09:40:00'; Target = 'usb'; Drive = 'E:'; BackupTarget = 'E:'
+            Status = 'OK'; DurationSec = 754.4; BitLocker = $true
+            Volumes = @([pscustomobject]@{ Drive = 'C:'; Used = [long]1.5GB })
+        }
+    }
+
+    It 'writes a manifest with the essentials and no key material' {
+        $m = New-Manifest -Info $script:info
+        $m | Should -Match 'Komputer: PC1'
+        $m | Should -Match 'Wynik: OK'
+        $m | Should -Match 'C:\s+użyte: 1\.5 GB'
+        $m | Should -Match '2026-10-13 09:40'
+        $m | Should -Match 'BitLocker: tak'
+        $m | Should -Match 'klucz nie jest zapisywany'
+    }
+
+    It 'writes restore instructions for a USB copy' {
+        $t = New-RestoreInstructions -Info $script:info
+        $t | Should -Match 'PC1'
+        $t | Should -Match 'dysk USB E:'
+        $t | Should -Match 'Odzyskiwanie obrazu systemu'
+        $t | Should -Match 'Mount-DiskImage'
+        $t | Should -Match 'klucz odzyskiwania BitLocker'
+    }
+
+    It 'writes restore instructions for an SMB copy that name the share but no credentials' {
+        $i = $script:info.PSObject.Copy()
+        $i.Target = 'smb'
+        $i.BackupTarget = '\\nas\share\WinResurect\PC1_2026-10-13_0940'
+        $t = New-RestoreInstructions -Info $i
+        $t | Should -Match 'nas\\share\\WinResurect\\PC1_2026-10-13_0940'
+        $t | Should -Match 'Wyszukaj obraz systemu w sieci'
+        $t | Should -Not -Match '(?i)hasło:|password'
+    }
+
+    It 'detects whether an image file exists' {
+        $root = Join-Path $TestDrive 'img'
+        Test-ImageFilePresent -Root $root | Should -BeFalse
+        New-Item -ItemType Directory -Path $root | Out-Null
+        New-Item -ItemType File -Path (Join-Path $root 'pusty.vhdx') | Out-Null
+        Test-ImageFilePresent -Root $root | Should -BeFalse
+        Set-Content -Path (Join-Path $root 'obraz.vhdx') -Value 'x'
+        Test-ImageFilePresent -Root $root | Should -BeTrue
+    }
+}
