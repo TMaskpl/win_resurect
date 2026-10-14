@@ -4,6 +4,10 @@
 
 Narzędzie robi **pełną kopię systemu (obraz) przed naprawą komputera**, na dysk USB albo udział SMB, używając wbudowanego w Windows `wbadmin`. Po nieudanej naprawie możesz wrócić do stanu sprzed ingerencji, a pojedyncze pliki odzyskać bez przywracania całości.
 
+## Status
+
+Wersja **przedpremierowa (0.1.0)**. Kopia na dysk **USB** została sprawdzona na Windows 11 Pro (obraz C:, D:, G: i partycji EFI/odzyskiwania, kod wyjścia 0, weryfikacja przeszła). Kopia na **udział SMB** jest zaimplementowana i przetestowana jednostkowo, ale nie przeszła jeszcze testu na prawdziwym udziale; do tego czasu traktuj ją jako eksperymentalną. Odtwarzanie z środowiska odzyskiwania (WinRE) czeka na test. Nie ma jeszcze oficjalnego wydania z sumą SHA256.
+
 ## Wymagania
 
 - Windows 10 lub 11, PowerShell 5.1 (jest w systemie), uprawnienia administratora.
@@ -13,7 +17,11 @@ Narzędzie robi **pełną kopię systemu (obraz) przed naprawą komputera**, na 
 
 ## Pobranie i weryfikacja
 
-1. Pobierz ze strony **Releases** plik `win_resurect-<wersja>.zip` oraz `SHA256SUMS.txt`.
+**Do czasu pierwszego wydania:** pobierz ZIP przyciskiem **Code → Download ZIP** na stronie repozytorium, rozpakuj go na dysk lokalny (np. `C:\win_resurect`, nie na dysk docelowy kopii) i sprawdź, że przejrzany przez ciebie kod pochodzi z oczekiwanego commita.
+
+**Po pierwszym wydaniu** (strona **Releases**):
+
+1. Pobierz plik `win_resurect-<wersja>.zip` oraz `SHA256SUMS.txt`.
 2. Sprawdź sumę w PowerShellu (wynik musi być taki sam jak w `SHA256SUMS.txt`):
 
 ```powershell
@@ -76,7 +84,7 @@ Pełna instrukcja jest w [`docs/PRZYWRACANIE.md`](docs/PRZYWRACANIE.md) i w plik
 | „Za mało miejsca na celu” | Użyj większego dysku albo zwolnij miejsce |
 | „Dysk USB musi być w NTFS” | Sformatuj dysk w NTFS (utracisz jego zawartość) |
 | Błąd połączenia z udziałem | Sprawdź adres, użytkownika, hasło i dostęp do sieci; przetestuj `net use` ręcznie |
-| Kod 1 i komunikat `wbadmin` | Zobacz `log.txt` w folderze kopii i dokumentację `wbadmin` |
+| Kod 1 i komunikat `wbadmin` | Zobacz `log.txt` w folderze kopii oraz szczegółowy log systemu: `C:\Windows\Logs\WindowsBackup\Backup-<data>.log` |
 
 ## Bezpieczeństwo
 
