@@ -6,7 +6,7 @@ Narzędzie robi **pełną kopię systemu (obraz) przed naprawą komputera**, na 
 
 ## Status
 
-Wersja **przedpremierowa (0.1.0)**. Kopia na dysk **USB** została sprawdzona na Windows 11 Pro (obraz C:, D:, G: i partycji EFI/odzyskiwania, kod wyjścia 0, weryfikacja przeszła). Kopia na **udział SMB** jest zaimplementowana i przetestowana jednostkowo, ale nie przeszła jeszcze testu na prawdziwym udziale; do tego czasu traktuj ją jako eksperymentalną. Odtwarzanie z środowiska odzyskiwania (WinRE) czeka na test. Nie ma jeszcze oficjalnego wydania z sumą SHA256.
+Wersja **przedpremierowa (0.1.0)**. Kopia na dysk **USB** została sprawdzona na Windows 11 Pro (obraz C:, D:, G: i partycji EFI/odzyskiwania, kod wyjścia 0, weryfikacja przeszła). Kopia na **udział SMB** jest zaimplementowana i przetestowana jednostkowo, ale nie przeszła jeszcze testu na prawdziwym udziale; do tego czasu traktuj ją jako eksperymentalną. Odtwarzanie z środowiska odzyskiwania (WinRE) czeka na test. Dodatkowo: **kopia codzienna wybranych folderów (restic)** jest zaimplementowana i przetestowana jednostkowo, ale nie przeszła jeszcze testów na prawdziwym Windows. Nie ma jeszcze oficjalnego wydania z sumą SHA256.
 
 ## Wymagania
 
@@ -53,7 +53,21 @@ Zmienna `WINRES_PASSWORD` jest tylko awaryjną opcją dla uruchomień bez nadzor
 
 Uruchamiaj narzędzie z dysku lokalnego (np. `C:\win_resurect`). Po podniesieniu uprawnień (UAC) dyski sieciowe zmapowane w sesji użytkownika znikają.
 
-## Co robi narzędzie
+## Kopia codzienna wybranych folderów (restic)
+
+Druga funkcja narzędzia: zadanie w Harmonogramie Windows, które **codziennie, różnicowo** kopiuje foldery z pliku `daily.json` na dysk USB (rozpoznawany po etykiecie) albo udział SMB. Używa [restic](https://restic.net) (szyfrowanie, deduplikacja, migawki VSS dla otwartych plików).
+
+```bat
+Start.cmd -Action install-daily -Target usb -Label BACKUP
+Start.cmd -Action install-daily -Target smb -Share \\nas\share -User uzytkownik
+Start.cmd -Action status
+Start.cmd -Action restore
+Start.cmd -Action remove-daily
+```
+
+Instalacja pobiera restic z oficjalnego wydania na GitHubie, w wersji i z sumą SHA256 zapisaną w `restic-version.json` (niezgodna suma przerywa instalację), tworzy `C:\ProgramData\WinResurect\`, pokazuje **raz** hasło repozytorium (zapisz je w KeePass; bez niego kopia jest nie do odczytania), otwiera `daily.json` do wpisania folderów i rejestruje zadania. Szczegóły: [`docs/KOPIA-CODZIENNA.md`](docs/KOPIA-CODZIENNA.md).
+
+## Co robi narzędzie (kopia całego systemu)
 
 1. Sprawdza uprawnienia, cel, miejsce, BitLocker i zasilanie. Przy błędzie niczego nie zapisuje.
 2. Łączy się z udziałem (SMB) na czas pracy.
@@ -88,7 +102,7 @@ Pełna instrukcja jest w [`docs/PRZYWRACANIE.md`](docs/PRZYWRACANIE.md) i w plik
 
 ## Bezpieczeństwo
 
-- Narzędzie niczego nie pobiera w czasie działania i niczego nie wysyła w sieć (poza zapisem na wskazany udział).
+- Kopia całego systemu niczego nie pobiera i niczego nie wysyła w sieć (poza zapisem na wskazany udział). Instalacja kopii codziennej pobiera wyłącznie restic z oficjalnego wydania GitHub (wersja i SHA256 przypięte w `restic-version.json`); nic nie jest wysyłane na zewnątrz.
 - Zmiany w systemie: połączenie sieciowe na czas pracy, migawki VSS tworzone przez `wbadmin`, pliki na nośniku docelowym.
 - Obraz zawiera cały system, w tym dane i zapisane hasła. Chroń nośnik jak dane produkcyjne.
 - Przed uruchomieniem zawsze weryfikuj sumę SHA256 pobranego ZIP-a.
