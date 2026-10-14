@@ -513,3 +513,44 @@ Describe 'fresh image check' {
         Test-ImageFilePresent -Root $root -NotOlderThan ([datetime]'2026-01-01') | Should -BeTrue
     }
 }
+
+Describe 'actions in the entry script' {
+    It 'keeps -Target without -Action working as the image action (bad drive gives exit 2)' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        & $pwsh -NoProfile -File (Join-Path $root 'Invoke-Resurect.ps1') -Target usb -Drive EE *> $null
+        $LASTEXITCODE | Should -Be 2
+    }
+
+    It 'dispatches -Action status and reports a not-installed copy with exit code 2' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        $dir = Join-Path $TestDrive 'pusty'
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        $old = $env:WINRES_HOME
+        try {
+            $env:WINRES_HOME = $dir
+            & $pwsh -NoProfile -File (Join-Path $root 'Invoke-Resurect.ps1') -Action status *> $null
+            $LASTEXITCODE | Should -Be 2
+        }
+        finally { if ($null -ne $old) { $env:WINRES_HOME = $old } else { Remove-Item Env:WINRES_HOME -ErrorAction SilentlyContinue } }
+    }
+
+    It 'dispatches -Action install-daily and rejects a bad label with exit code 2' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        & $pwsh -NoProfile -File (Join-Path $root 'Invoke-Resurect.ps1') -Action install-daily -Target usb -Label 'zły/label' *> $null
+        $LASTEXITCODE | Should -Be 2
+    }
+
+    It 'dispatches actions also when the script text is loaded as a scriptblock (GPO workaround)' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        Push-Location $root
+        try {
+            & $pwsh -NoProfile -Command "& ([scriptblock]::Create((Get-Content -Raw .\Invoke-Resurect.ps1))) -Action install-daily -Target usb -Label 'zły/label'" *> $null
+            $LASTEXITCODE | Should -Be 2
+        }
+        finally { Pop-Location }
+    }
+}

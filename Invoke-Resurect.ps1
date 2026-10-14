@@ -1,21 +1,59 @@
 ﻿[CmdletBinding()]
 param(
+    [ValidateSet('image', 'install-daily', 'status', 'restore', 'remove-daily')][string]$Action,
     [ValidateSet('usb', 'smb')][string]$Target,
     [string]$Drive,
+    [string]$Label,
     [string]$Share,
     [string]$User,
-    [string]$Folder = 'WinResurect',
-    [switch]$Yes
+    [string]$Folder,
+    [switch]$Yes,
+    [string]$Root
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$modulePath = Join-Path (Join-Path $root 'src') 'WinResurect.psm1'
-try { Import-Module $modulePath -Force -ErrorAction Stop }
-catch { . ([scriptblock]::Create((Get-Content -Raw -LiteralPath $modulePath))) }
+$root = if ($Root) { $Root } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+foreach ($m in 'WinResurect.psm1', 'DailyBackup.psm1') {
+    $modulePath = Join-Path (Join-Path $root 'src') $m
+    try { Import-Module $modulePath -Force -ErrorAction Stop }
+    catch { . ([scriptblock]::Create((Get-Content -Raw -LiteralPath $modulePath))) }
+}
 
 Write-Host "win_resurect $(Get-ToolVersion) - kopia całego systemu przed naprawą" -ForegroundColor Cyan
+
+if (-not $Action) {
+    if ($Target) { $Action = 'image' }
+    else {
+        Write-Host '1) Kopia całego systemu (obraz)'
+        Write-Host '2) Zainstaluj lub zaktualizuj kopię codzienną'
+        Write-Host '3) Status kopii codziennej'
+        Write-Host '4) Przywróć pliki z kopii codziennej'
+        Write-Host '5) Usuń kopię codzienną'
+        $choice = Read-Host 'Wybierz (1-5)'
+        switch ($choice) {
+            '1' { $Action = 'image' }
+            '2' { $Action = 'install-daily' }
+            '3' { $Action = 'status' }
+            '4' { $Action = 'restore' }
+            '5' { $Action = 'remove-daily' }
+            default { Write-Host 'Przerwano.'; exit 3 }
+        }
+    }
+}
+
+if ($Action -ne 'image') {
+    $files = @{ 'install-daily' = 'Install-DailyBackup.ps1'; 'status' = 'Get-DailyStatus.ps1'; 'restore' = 'Restore-DailyBackup.ps1'; 'remove-daily' = 'Remove-DailyBackup.ps1' }
+    $splat = @{ Root = $root }
+    if ($Action -eq 'install-daily') {
+        foreach ($k in 'Target', 'Label', 'Share', 'User', 'Folder') { if ((Get-Variable $k).Value) { $splat[$k] = (Get-Variable $k).Value } }
+    }
+    if ($Yes -and ($Action -eq 'install-daily' -or $Action -eq 'remove-daily')) { $splat['Yes'] = $true }
+    & ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root $files[$Action])))) @splat
+    exit 0
+}
+
+if (-not $Folder) { $Folder = 'WinResurect' }
 
 if (-not $Target) {
     Write-Host '1) Dysk USB   2) Udział SMB'
