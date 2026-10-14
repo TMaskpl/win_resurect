@@ -299,3 +299,158 @@ Describe 'Write-DailyLog' {
         (Get-Content -LiteralPath $p -Raw) | Should -Match 'linia 8'
     }
 }
+
+Describe 'Invoke-DailyJob (backup)' {
+    BeforeAll {
+        function New-TestCredential([string]$User, [string]$Pass) {
+            New-Object System.Management.Automation.PSCredential($User, (ConvertTo-SecureString $Pass -AsPlainText -Force))
+        }
+        $script:usbVol = @([pscustomobject]@{ Drive = 'E:'; Label = 'BACKUP'; FileSystem = 'NTFS'; DriveType = 3 })
+        $script:smbTarget = @{ Type = 'smb'; Label = ''; Share = '\\nas\share'; User = 'uzytkownik'; Folder = 'WinResurectDaily' }
+        function Invoke-TestJob {
+            param($Config, [object[]]$Volumes = $script:usbVol, [string[]]$Existing = @('C:\Users\Jan\Documents'), $Credential = $null)
+            $script:existing = $Existing
+            $exists = { param($p) $script:existing -contains $p }
+            $cred = $Credential
+            $reader = { $cred }.GetNewClosure()
+            Invoke-DailyJob -Mode backup -Config $Config -Volumes $Volumes -Runner $script:runner -WorkDir $script:work `
+                -ReadSmbCredential $reader -Connector $script:connector -Disconnector $script:disconnector `
+                -PathExists $exists -Clock { [datetime]::SpecifyKind([datetime]'2026-10-14T10:30:00', 'Utc') } `
+                -ComputerName 'PC1' -ResticVersion '0.18.0'
+        }
+    }
+    BeforeEach {
+        $script:work = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:work | Out-Null
+        $script:calls = New-Object System.Collections.ArrayList
+        $script:envSeen = $null
+        $script:backupExit = 0
+        $script:backupOut = @('{"message_type":"summary","data_added":2048,"snapshot_id":"deadbeefcafe"}')
+        $script:netFail = $false
+        $script:seenPassword = $null
+        $script:runner = {
+            param($Exe, $ArgList)
+            $script:calls.Add("$Exe " + ($ArgList -join ' ')) | Out-Null
+            if ($ArgList[0] -eq 'backup') {
+                $script:envSeen = @{ Repo = $env:RESTIC_REPOSITORY; Pass = $env:RESTIC_PASSWORD_FILE }
+                if ($script:backupExit -eq -99) { throw 'restic.exe nie istnieje' }
+                return @{ ExitCode = $script:backupExit; Output = $script:backupOut }
+            }
+            if ($ArgList[0] -eq 'snapshots') { return @{ ExitCode = 0; Output = @('[{"id":"a","short_id":"a","time":"2026-10-14T12:00:00+02:00","hostname":"PC1","paths":[]},{"id":"b","short_id":"b","time":"2026-10-15T12:00:00+02:00","hostname":"PC1","paths":[]}]') } }
+            return @{ ExitCode = 0; Output = @() }
+        }
+        $script:connector = {
+            param($Share, $User, $Password)
+            $script:calls.Add("connect $Share $User") | Out-Null
+            $script:seenPassword = $Password
+            if ($script:netFail) { return @{ ExitCode = 1219; Output = @('istnieje już połączenie') } }
+            return @{ ExitCode = 0; Output = @() }
+        }
+        $script:disconnector = { param($Share) $script:calls.Add("disconnect $Share") | Out-Null; return @{ ExitCode = 0; Output = @() } }
+    }
+
+    It 'backs up to the USB disk found by label with the right repository and password file' {
+        $before = $env:RESTIC_REPOSITORY
+        $r = Invoke-TestJob (New-TestDailyConfig)
+        $r.ExitCode | Should -Be 0
+        $r.Status | Should -Be 'ok'
+        @($script:calls) | Should -Be @(
+            'restic unlock',
+            'restic backup --json --use-fs-snapshot --host PC1 --exclude *.tmp C:\Users\Jan\Documents',
+            'restic snapshots --json --host PC1')
+        $script:envSeen.Repo | Should -Be 'E:\WinResurectDaily\PC1'
+        $script:envSeen.Pass | Should -Be (Join-Path $script:work 'repo.pass')
+        $env:RESTIC_REPOSITORY | Should -Be $before
+        $lr = Read-LastRun -Path (Join-Path $script:work 'last-run.json')
+        $lr.status | Should -Be 'ok'
+        $lr.added_bytes | Should -Be 2048
+        $lr.snapshot | Should -Be 'deadbeef'
+        $lr.snapshots | Should -Be 2
+        $lr.restic_version | Should -Be '0.18.0'
+        $lr.last_success | Should -Not -BeNullOrEmpty
+        (Get-Content -LiteralPath (Join-Path $script:work 'daily.log') -Raw) | Should -Match 'ok'
+    }
+
+    It 'skips folders that do not exist, backs up the rest and ends with warn' {
+        $c = New-TestDailyConfig -Folders @('C:\Users\Jan\Documents', 'D:\Zniknal')
+        $r = Invoke-TestJob $c
+        $r.ExitCode | Should -Be 0
+        $r.Status | Should -Be 'warn'
+        ($script:calls | Where-Object { $_ -like 'restic backup*' }) | Should -Not -Match 'Zniknal'
+        @((Read-LastRun -Path (Join-Path $script:work 'last-run.json')).skipped_folders) | Should -Be @('D:\Zniknal')
+    }
+
+    It 'fails without running restic when no listed folder exists' {
+        $r = Invoke-TestJob (New-TestDailyConfig) -Existing @()
+        $r.ExitCode | Should -Be 1
+        $r.Status | Should -Be 'fail'
+        ($script:calls | Where-Object { $_ -like 'restic backup*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'fails with an unavailable-target note and never touches restic when the USB label is missing' {
+        $c = New-TestDailyConfig -Target @{ Type = 'usb'; Label = 'NIEMA'; Share = ''; User = ''; Folder = 'WinResurectDaily' }
+        $r = Invoke-TestJob $c
+        $r.ExitCode | Should -Be 1
+        $script:calls.Count | Should -Be 0
+        (Read-LastRun -Path (Join-Path $script:work 'last-run.json')).note | Should -Match 'niedostępny'
+    }
+
+    It 'maps restic exit code 3 to warn and others to fail with a note without client paths' {
+        $script:backupExit = 3
+        (Invoke-TestJob (New-TestDailyConfig)).Status | Should -Be 'warn'
+        $script:backupExit = 1
+        $script:backupOut = @('Fatal: unable to open repository at E:\WinResurectDaily\PC1')
+        $r = Invoke-TestJob (New-TestDailyConfig)
+        $r.ExitCode | Should -Be 1
+        $r.LastRun.note | Should -Match 'unable to open repository'
+        $r.LastRun.note | Should -Not -Match 'WinResurectDaily'
+    }
+
+    It 'keeps last_success from an earlier good run when the next one fails' {
+        Invoke-TestJob (New-TestDailyConfig) | Out-Null
+        $good = (Read-LastRun -Path (Join-Path $script:work 'last-run.json')).last_success
+        $script:backupExit = 1
+        Invoke-TestJob (New-TestDailyConfig) | Out-Null
+        $lr = Read-LastRun -Path (Join-Path $script:work 'last-run.json')
+        $lr.status | Should -Be 'fail'
+        $lr.last_success | Should -Be $good
+    }
+
+    It 'turns a runner exception into a failed run instead of throwing' {
+        $script:backupExit = -99
+        $r = Invoke-TestJob (New-TestDailyConfig)
+        $r.ExitCode | Should -Be 1
+        $r.LastRun.note | Should -Match 'nie istnieje'
+    }
+
+    It 'connects to SMB through the connector, never leaks the password, and always disconnects' {
+        $c = New-TestDailyConfig -Target $script:smbTarget
+        $r = Invoke-TestJob $c -Volumes @() -Credential (New-TestCredential 'uzytkownik' 'Sekret1')
+        $r.ExitCode | Should -Be 0
+        $script:calls[0] | Should -Be 'connect \\nas\share uzytkownik'
+        $script:calls[-1] | Should -Be 'disconnect \\nas\share'
+        $script:seenPassword | Should -Be 'Sekret1'
+        $script:envSeen.Repo | Should -Be '\\nas\share\WinResurectDaily\PC1'
+        (@($script:calls) -join "`n") | Should -Not -Match 'Sekret1'
+        $all = (Get-ChildItem $script:work -File | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+        $all | Should -Not -Match 'Sekret1'
+    }
+
+    It 'fails without connecting when SMB credentials are missing' {
+        $c = New-TestDailyConfig -Target $script:smbTarget
+        $r = Invoke-TestJob $c -Volumes @() -Credential $null
+        $r.ExitCode | Should -Be 1
+        $r.LastRun.note | Should -Match 'poświadczeń'
+        $script:calls.Count | Should -Be 0
+    }
+
+    It 'fails with the Windows error code when the share cannot be connected and runs no restic command' {
+        $script:netFail = $true
+        $c = New-TestDailyConfig -Target $script:smbTarget
+        $r = Invoke-TestJob $c -Volumes @() -Credential (New-TestCredential 'uzytkownik' 'Sekret1')
+        $r.ExitCode | Should -Be 1
+        $r.LastRun.note | Should -Match '1219'
+        $r.LastRun.note | Should -Not -Match 'Sekret1'
+        ($script:calls | Where-Object { $_ -like 'restic*' }) | Should -BeNullOrEmpty
+    }
+}

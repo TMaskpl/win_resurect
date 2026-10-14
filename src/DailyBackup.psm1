@@ -316,3 +316,84 @@ function Write-DailyLog {
     }
     Add-Content -LiteralPath $Path -Value $Lines -Encoding UTF8
 }
+
+function Invoke-DailyJob {
+    param(
+        [Parameter(Mandatory)][ValidateSet('backup')][string]$Mode,
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Volumes,
+        [Parameter(Mandatory)][scriptblock]$Runner,
+        [Parameter(Mandatory)][string]$WorkDir,
+        [scriptblock]$ReadSmbCredential = { $null },
+        [scriptblock]$Connector = { param($Share, $User, $Password) Connect-NetworkShare -Share $Share -User $User -Password $Password },
+        [scriptblock]$Disconnector = { param($Share) Disconnect-NetworkShare -Share $Share },
+        [scriptblock]$PathExists = { param($Path) Test-Path -LiteralPath $Path },
+        [scriptblock]$Clock = { Get-Date },
+        [string]$ComputerName = $env:COMPUTERNAME,
+        [string]$ResticVersion = ''
+    )
+    $started = & $Clock
+    $log = New-Object System.Collections.ArrayList
+    $secrets = New-Object System.Collections.ArrayList
+    $say = { param($m) [void]$log.Add((Hide-Secrets -Text $m -Secrets @($secrets))) }
+    $lastPath = Join-Path $WorkDir 'last-run.json'
+    $previous = Read-LastRun -Path $lastPath
+    $status = 'ok'; $note = ''; $added = [long]0; $snap = ''; $count = 0; $skipped = @()
+    $connected = $false; $shareRoot = ''
+    $oldRepo = $env:RESTIC_REPOSITORY; $oldPass = $env:RESTIC_PASSWORD_FILE
+    try {
+        $target = Resolve-DailyTarget -Config $Config -Volumes $Volumes -ComputerName $ComputerName
+        if (-not $target.Ok) { $status = 'fail'; $note = $target.Reason }
+        if ($status -ne 'fail' -and $Config.Target.Type -eq 'smb') {
+            $cred = & $ReadSmbCredential
+            if (-not $cred) { $status = 'fail'; $note = 'brak poświadczeń SMB (uruchom instalację ponownie)' }
+            else {
+                $plain = $cred.GetNetworkCredential().Password
+                [void]$secrets.Add($plain)
+                $c = & $Connector $target.ShareRoot $Config.Target.User $plain
+                if ($c.ExitCode -ne 0) { $status = 'fail'; $note = "nie można połączyć się z udziałem (kod $($c.ExitCode)): $(@($c.Output) -join ' ')" }
+                else { $connected = $true; $shareRoot = $target.ShareRoot }
+            }
+        }
+        if ($status -ne 'fail') {
+            $env:RESTIC_REPOSITORY = $target.Repository
+            $env:RESTIC_PASSWORD_FILE = Join-Path $WorkDir 'repo.pass'
+            $split = Select-ExistingFolders -Folders @($Config.Folders) -Exists $PathExists
+            $skipped = @($split.Missing)
+            foreach ($m in $skipped) { & $say "Ostrzeżenie: folder nie istnieje, pominięto: $m" }
+            if (@($split.Existing).Count -eq 0) { $status = 'fail'; $note = 'żaden folder z listy nie istnieje' }
+            else {
+                try { [void](& $Runner 'restic' @('unlock')) } catch { }
+                try { $r = & $Runner 'restic' (Get-DailyBackupArgs -Config $Config -Folders @($split.Existing) -ComputerName $ComputerName) }
+                catch { $r = @{ ExitCode = -1; Output = @($_.Exception.Message) } }
+                $status = ConvertTo-DailyStatus -ExitCode $r.ExitCode
+                $sum = ConvertFrom-ResticSummary -Lines $r.Output
+                $added = $sum.AddedBytes; $snap = $sum.Snapshot
+                if ($status -ne 'ok') { $note = Get-FailureNote -Lines $r.Output }
+                if ($status -ne 'fail') {
+                    try {
+                        $s = & $Runner 'restic' @('snapshots', '--json', '--host', $ComputerName)
+                        $count = @(ConvertFrom-ResticSnapshots -Json (@($s.Output) -join "`n")).Count
+                    }
+                    catch { }
+                    if ($skipped.Count -gt 0) {
+                        $status = Get-WorseStatus -A $status -B 'warn'
+                        if (-not $note) { $note = "pominięto $($skipped.Count) nieistniejących folderów" }
+                    }
+                }
+            }
+        }
+    }
+    finally {
+        if ($null -eq $oldRepo) { Remove-Item Env:RESTIC_REPOSITORY -ErrorAction SilentlyContinue } else { $env:RESTIC_REPOSITORY = $oldRepo }
+        if ($null -eq $oldPass) { Remove-Item Env:RESTIC_PASSWORD_FILE -ErrorAction SilentlyContinue } else { $env:RESTIC_PASSWORD_FILE = $oldPass }
+        if ($connected) { try { [void](& $Disconnector $shareRoot) } catch { } }
+    }
+    $finished = & $Clock
+    $lr = New-LastRun -Status $status -Started $started -Finished $finished -AddedBytes $added -Snapshot $snap -Snapshots $count `
+        -ResticVersion $ResticVersion -Skipped $skipped -Note (Hide-Secrets -Text $note -Secrets @($secrets)) -Previous $previous
+    Save-LastRun -Path $lastPath -LastRun $lr
+    & $say "Kopia codzienna: $status$(if ($lr.note) { ' - ' + $lr.note })"
+    Write-DailyLog -Path (Join-Path $WorkDir 'daily.log') -Lines (@($log) | ForEach-Object { "$($started.ToString('yyyy-MM-dd HH:mm:ss')) $_" })
+    return [pscustomobject]@{ ExitCode = $(if ($status -eq 'fail') { 1 } else { 0 }); Status = $status; LastRun = [pscustomobject]$lr }
+}
