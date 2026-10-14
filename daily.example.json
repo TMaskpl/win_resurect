@@ -1,0 +1,27 @@
+{
+  "target": {
+    "type": "usb",
+    "label": "BACKUP",
+    "folder": "WinResurectDaily"
+  },
+  "folders": [
+    "C:\\Users\\Jan\\Documents",
+    "D:\\Ksiegowosc"
+  ],
+  "excludes": [
+    "*.tmp",
+    "Thumbs.db",
+    "node_modules"
+  ],
+  "schedule": {
+    "time": "12:30"
+  },
+  "retention": {
+    "daily": 14,
+    "weekly": 8,
+    "monthly": 6
+  },
+  "report": {
+    "enabled": false
+  }
+}

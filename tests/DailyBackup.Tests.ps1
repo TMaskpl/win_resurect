@@ -582,3 +582,89 @@ Describe 'restore helpers' {
         finally { if ($null -ne $old) { $env:WINRES_HOME = $old } else { Remove-Item Env:WINRES_HOME -ErrorAction SilentlyContinue } }
     }
 }
+
+Describe 'installer helpers' {
+    It 'validates the pinned restic specification' {
+        $url = 'https://github.com/restic/restic/releases/download/v0.18.0/restic_0.18.0_windows_amd64.zip'
+        $sha = 'a' * 64
+        $p = Join-Path $TestDrive 'restic-version.json'
+        Set-Content -LiteralPath $p -Value ('{ "version": "0.18.0", "url": "' + $url + '", "sha256": "' + $sha + '" }') -Encoding UTF8
+        $s = Get-ResticVersionSpec -Path $p
+        $s.Version | Should -Be '0.18.0'
+        $s.Sha256 | Should -Be $sha
+        $badCases = @(
+            ('{ "version": "0.18.0", "url": "https://evil.example/x.zip", "sha256": "' + $sha + '" }'),
+            ('{ "version": "0.18.0", "url": "' + $url + '", "sha256": "zzz" }'),
+            ('{ "url": "' + $url + '", "sha256": "' + $sha + '" }'),
+            '{ nie json'
+        )
+        foreach ($bad in $badCases) {
+            Set-Content -LiteralPath $p -Value $bad -Encoding UTF8
+            { Get-ResticVersionSpec -Path $p } | Should -Throw
+        }
+        { Get-ResticVersionSpec -Path (Join-Path $TestDrive 'brak.json') } | Should -Throw
+    }
+
+    It 'compares SHA256 case-insensitively and rejects a mismatch' {
+        $p = Join-Path $TestDrive 'plik.bin'
+        [System.IO.File]::WriteAllBytes($p, [byte[]](1, 2, 3))
+        $h = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash
+        Test-FileSha256 -Path $p -Expected $h.ToLower() | Should -BeTrue
+        Test-FileSha256 -Path $p -Expected ('0' * 64) | Should -BeFalse
+        Test-FileSha256 -Path (Join-Path $TestDrive 'brak.bin') -Expected $h | Should -BeFalse
+    }
+
+    It 'generates unambiguous random passwords' {
+        $p = New-RandomPassword -Length 40
+        $p.Length | Should -Be 40
+        $p | Should -Match '^[abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789]+$'
+        (New-RandomPassword) | Should -Not -Be (New-RandomPassword)
+    }
+
+    It 'creates a valid config for a USB and an SMB target' {
+        $u = New-DailyConfigJson -Type usb -Label 'BACKUP' -Folder 'WinResurectDaily' -Time '12:30' -Folders @('C:\Users\Jan\Documents')
+        $p = Join-Path $TestDrive 'u.json'
+        Set-Content -LiteralPath $p -Value $u -Encoding UTF8
+        (Read-DailyConfig -Path $p).Target.Label | Should -Be 'BACKUP'
+        $s = New-DailyConfigJson -Type smb -Share '\\nas\share' -User 'uzytkownik' -Folder 'WinResurectDaily' -Time '13:00' -Folders @('D:\Ksiegowosc')
+        Set-Content -LiteralPath $p -Value $s -Encoding UTF8
+        $c = Read-DailyConfig -Path $p
+        $c.Target.Share | Should -Be '\\nas\share'
+        $c.Time | Should -Be '13:00'
+    }
+
+    It 'updates only the target and time of an existing config and keeps folders, excludes and retention' {
+        $old = '{ "target": { "type": "usb", "label": "STARY" }, "folders": ["C:\\Dane", "D:\\B"], "excludes": ["*.tmp"], "schedule": { "time": "12:30" }, "retention": { "daily": 30, "weekly": 4, "monthly": 2 } }'
+        $new = Update-DailyConfigJson -Json $old -Type smb -Share '\\nas\share' -User 'uzytkownik' -Folder 'WinResurectDaily' -Time '14:15'
+        $p = Join-Path $TestDrive 'upd.json'
+        Set-Content -LiteralPath $p -Value $new -Encoding UTF8
+        $c = Read-DailyConfig -Path $p
+        $c.Target.Type | Should -Be 'smb'
+        $c.Time | Should -Be '14:15'
+        @($c.Folders) | Should -Be @('C:\Dane', 'D:\B')
+        @($c.Excludes) | Should -Be @('*.tmp')
+        $c.Retention.Daily | Should -Be 30
+        $c.Retention.Monthly | Should -Be 2
+    }
+}
+
+Describe 'entry scripts for the daily backup' {
+    It 'reports a not-installed copy from Status with exit code 2 (no Windows calls before the check)' {
+        $dir = Join-Path $TestDrive 'pusty'
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        $old = $env:WINRES_HOME
+        try {
+            $env:WINRES_HOME = $dir
+            $pwsh = (Get-Process -Id $PID).Path
+            & $pwsh -NoProfile -File (Join-Path $script:root 'Get-DailyStatus.ps1') -Root $script:root *> $null
+            $LASTEXITCODE | Should -Be 2
+        }
+        finally { if ($null -ne $old) { $env:WINRES_HOME = $old } else { Remove-Item Env:WINRES_HOME -ErrorAction SilentlyContinue } }
+    }
+
+    It 'rejects bad install parameters with exit code 2 before touching the system' {
+        $pwsh = (Get-Process -Id $PID).Path
+        & $pwsh -NoProfile -File (Join-Path $script:root 'Install-DailyBackup.ps1') -Root $script:root -Target usb -Label 'zły/label' *> $null
+        $LASTEXITCODE | Should -Be 2
+    }
+}

@@ -390,6 +390,7 @@ function Get-LocalVolumes {
             Drive      = [string]$d.DeviceID
             FileSystem = [string]$d.FileSystem
             DriveType  = [int]$d.DriveType
+            Label      = [string]$d.VolumeName
             Size       = $size
             Free       = $free
             Used       = [long]($size - $free)

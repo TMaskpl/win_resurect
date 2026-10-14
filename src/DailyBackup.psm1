@@ -496,3 +496,104 @@ function New-RestoreTarget {
     param([Parameter(Mandatory)][string]$Base, [Parameter(Mandatory)][datetime]$Now)
     return ('{0}\Przywrocone_{1}' -f $Base.TrimEnd('\'), $Now.ToString('yyyy-MM-dd_HHmm', [System.Globalization.CultureInfo]::InvariantCulture))
 }
+
+function Get-ResticVersionSpec {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Brak pliku z wersją restic: $Path" }
+    try { $j = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'restic-version.json: niepoprawny JSON' }
+    $v = [string](Get-ConfigValue $j 'version' '')
+    $u = [string](Get-ConfigValue $j 'url' '')
+    $h = [string](Get-ConfigValue $j 'sha256' '')
+    if ($v -notmatch '^\d+\.\d+\.\d+$') { throw 'restic-version.json: niepoprawna wersja' }
+    if ($u -notmatch '^https://github\.com/restic/restic/releases/download/') { throw 'restic-version.json: adres musi wskazywać oficjalne wydanie restic na GitHubie' }
+    if ($h -notmatch '^[0-9a-fA-F]{64}$') { throw 'restic-version.json: suma SHA256 musi mieć 64 znaki szesnastkowe' }
+    return [pscustomobject]@{ Version = $v; Url = $u; Sha256 = $h.ToLower() }
+}
+
+function Test-FileSha256 {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Expected)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    return ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower() -eq $Expected.Trim().ToLower())
+}
+
+function New-RandomPassword {
+    param([int]$Length = 32)
+    $chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'.ToCharArray()
+    $limit = [uint32]([Math]::Floor(4294967296 / $chars.Length) * $chars.Length)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $bytes = New-Object byte[] 4
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $Length; $i++) {
+        do { $rng.GetBytes($bytes); $v = [BitConverter]::ToUInt32($bytes, 0) } while ($v -ge $limit)
+        [void]$sb.Append($chars[[int]($v % $chars.Length)])
+    }
+    return $sb.ToString()
+}
+
+function Set-RestrictedAcl {
+    # Tylko Windows: SYSTEM i Administratorzy, bez dziedziczenia.
+    param([Parameter(Mandatory)][string]$Path)
+    $isDir = (Get-Item -LiteralPath $Path).PSIsContainer
+    $acl = if ($isDir) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
+    $acl.SetAccessRuleProtection($true, $false)
+    $inherit = if ($isDir) { 'ContainerInherit,ObjectInherit' } else { 'None' }
+    foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
+        $id = New-Object System.Security.Principal.SecurityIdentifier($sid)
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'FullControl', $inherit, 'None', 'Allow')))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function New-DailyConfigJson {
+    param(
+        [Parameter(Mandatory)][string]$Type, [string]$Label = '', [string]$Share = '', [string]$User = '',
+        [string]$Folder = 'WinResurectDaily', [string]$Time = '12:30', [string[]]$Folders = @()
+    )
+    $target = [ordered]@{ type = $Type }
+    if ($Type -eq 'usb') { $target['label'] = $Label } else { $target['share'] = $Share; $target['user'] = $User }
+    $target['folder'] = $Folder
+    $cfg = [ordered]@{
+        target = $target; folders = @($Folders); excludes = @('*.tmp', 'Thumbs.db', 'node_modules')
+        schedule = [ordered]@{ time = $Time }; retention = [ordered]@{ daily = 14; weekly = 8; monthly = 6 }
+        report = [ordered]@{ enabled = $false }
+    }
+    return ($cfg | ConvertTo-Json -Depth 6)
+}
+
+function Update-DailyConfigJson {
+    param(
+        [Parameter(Mandatory)][string]$Json, [Parameter(Mandatory)][string]$Type, [string]$Label = '',
+        [string]$Share = '', [string]$User = '', [string]$Folder = 'WinResurectDaily', [string]$Time = '12:30'
+    )
+    $o = $Json | ConvertFrom-Json
+    $target = [ordered]@{ type = $Type }
+    if ($Type -eq 'usb') { $target['label'] = $Label } else { $target['share'] = $Share; $target['user'] = $User }
+    $target['folder'] = $Folder
+    $o | Add-Member -NotePropertyName target -NotePropertyValue ([pscustomobject]$target) -Force
+    $sch = [pscustomobject]@{ time = $Time }
+    $o | Add-Member -NotePropertyName schedule -NotePropertyValue $sch -Force
+    return ($o | ConvertTo-Json -Depth 6)
+}
+
+function Invoke-AsSystem {
+    # Tylko Windows: jednorazowe zadanie jako SYSTEM; skrypt w pliku z ograniczonym ACL, wynik w logu.
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)][string]$WorkDir, [int]$TimeoutSec = 600)
+    $script = '{0}\{1}.ps1' -f $WorkDir, $Name
+    $log = '{0}\{1}.log' -f $WorkDir, $Name
+    Set-Content -LiteralPath $script -Value $ScriptText -Encoding UTF8
+    Set-RestrictedAcl -Path $script
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$script`" *> `"$log`""
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $Name -Action $action -Principal $principal -Force | Out-Null
+    try {
+        Start-ScheduledTask -TaskName $Name
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        do { Start-Sleep -Seconds 2; $state = (Get-ScheduledTask -TaskName $Name).State } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
+        return (Get-ScheduledTaskInfo -TaskName $Name).LastTaskResult
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+    }
+}
