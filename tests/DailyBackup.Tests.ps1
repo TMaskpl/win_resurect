@@ -548,3 +548,37 @@ Describe 'Get-DailyTaskSpecs' {
         $m.RestartCount | Should -Be 0
     }
 }
+
+Describe 'restore helpers' {
+    It 'builds the restore command with optional include paths' {
+        @(Get-RestoreArgs -SnapshotId 'aaaaaaaa' -Target 'C:\Odzysk') | Should -Be @('restore', 'aaaaaaaa', '--target', 'C:\Odzysk')
+        $a = @(Get-RestoreArgs -SnapshotId 'aaaaaaaa' -Target 'C:\Odzysk' -Include @('C:\Dane\A', 'C:\Dane\B'))
+        $a | Should -Be @('restore', 'aaaaaaaa', '--target', 'C:\Odzysk', '--include', 'C:\Dane\A', '--include', 'C:\Dane\B')
+    }
+
+    It 'never accepts a restore target that overwrites, lies in or contains a backed-up folder' {
+        $folders = @('C:\Users\Jan\Documents', 'D:\Ksiegowosc')
+        Test-RestoreTargetSafe -Target 'C:\Users\Jan\Desktop\Przywrocone_1' -Folders $folders | Should -BeTrue
+        Test-RestoreTargetSafe -Target 'C:\Users\Jan\Documents' -Folders $folders | Should -BeFalse
+        Test-RestoreTargetSafe -Target 'c:\users\jan\documents\\' -Folders $folders | Should -BeFalse
+        Test-RestoreTargetSafe -Target 'C:\Users\Jan\Documents\Przywrocone' -Folders $folders | Should -BeFalse
+        Test-RestoreTargetSafe -Target 'C:\Users\Jan' -Folders $folders | Should -BeFalse
+        Test-RestoreTargetSafe -Target 'D:\' -Folders $folders | Should -BeFalse
+        Test-RestoreTargetSafe -Target '' -Folders $folders | Should -BeFalse
+    }
+
+    It 'names the restore folder by date and time under the given base' {
+        New-RestoreTarget -Base 'C:\Users\Jan\Desktop' -Now ([datetime]'2026-10-14T13:05:00') | Should -Be 'C:\Users\Jan\Desktop\Przywrocone_2026-10-14_1305'
+    }
+
+    It 'resolves the install home from WINRES_HOME or ProgramData' {
+        $old = $env:WINRES_HOME
+        try {
+            $env:WINRES_HOME = 'X:\Test\Home'
+            Get-DailyHome | Should -Be 'X:\Test\Home'
+            Remove-Item Env:WINRES_HOME
+            Get-DailyHome | Should -Match 'WinResurect$'
+        }
+        finally { if ($null -ne $old) { $env:WINRES_HOME = $old } else { Remove-Item Env:WINRES_HOME -ErrorAction SilentlyContinue } }
+    }
+}

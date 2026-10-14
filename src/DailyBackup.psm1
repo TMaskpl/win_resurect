@@ -466,3 +466,33 @@ function Unregister-DailyTasks {
         Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue
     }
 }
+
+function Get-DailyHome {
+    if ($env:WINRES_HOME) { return $env:WINRES_HOME }
+    $pd = if ($env:ProgramData) { $env:ProgramData } else { 'C:\ProgramData' }
+    return ('{0}\WinResurect' -f $pd.TrimEnd('\'))
+}
+
+function Get-RestoreArgs {
+    param([Parameter(Mandatory)][string]$SnapshotId, [Parameter(Mandatory)][string]$Target, [string[]]$Include = @())
+    $a = @('restore', $SnapshotId, '--target', $Target)
+    foreach ($i in $Include) { $a += @('--include', $i) }
+    return $a
+}
+
+function Test-RestoreTargetSafe {
+    param([string]$Target, [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Folders)
+    if (-not $Target -or -not $Target.Trim()) { return $false }
+    $t = $Target.Trim().TrimEnd('\').ToLower()
+    if ($t -match '^[a-z]:$') { return $false }
+    foreach ($f in $Folders) {
+        $x = $f.Trim().TrimEnd('\').ToLower()
+        if ($t -eq $x -or $t.StartsWith($x + '\') -or $x.StartsWith($t + '\')) { return $false }
+    }
+    return $true
+}
+
+function New-RestoreTarget {
+    param([Parameter(Mandatory)][string]$Base, [Parameter(Mandatory)][datetime]$Now)
+    return ('{0}\Przywrocone_{1}' -f $Base.TrimEnd('\'), $Now.ToString('yyyy-MM-dd_HHmm', [System.Globalization.CultureInfo]::InvariantCulture))
+}
