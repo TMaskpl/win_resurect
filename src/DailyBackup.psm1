@@ -319,7 +319,7 @@ function Write-DailyLog {
 
 function Invoke-DailyJob {
     param(
-        [Parameter(Mandatory)][ValidateSet('backup')][string]$Mode,
+        [Parameter(Mandatory)][ValidateSet('backup', 'maintenance', 'init')][string]$Mode,
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Volumes,
         [Parameter(Mandatory)][scriptblock]$Runner,
@@ -336,7 +336,8 @@ function Invoke-DailyJob {
     $log = New-Object System.Collections.ArrayList
     $secrets = New-Object System.Collections.ArrayList
     $say = { param($m) [void]$log.Add((Hide-Secrets -Text $m -Secrets @($secrets))) }
-    $lastPath = Join-Path $WorkDir 'last-run.json'
+    $lastName = switch ($Mode) { 'backup' { 'last-run.json' } 'maintenance' { 'last-maintenance.json' } default { 'last-init.json' } }
+    $lastPath = Join-Path $WorkDir $lastName
     $previous = Read-LastRun -Path $lastPath
     $status = 'ok'; $note = ''; $added = [long]0; $snap = ''; $count = 0; $skipped = @()
     $connected = $false; $shareRoot = ''
@@ -358,28 +359,48 @@ function Invoke-DailyJob {
         if ($status -ne 'fail') {
             $env:RESTIC_REPOSITORY = $target.Repository
             $env:RESTIC_PASSWORD_FILE = Join-Path $WorkDir 'repo.pass'
-            $split = Select-ExistingFolders -Folders @($Config.Folders) -Exists $PathExists
-            $skipped = @($split.Missing)
-            foreach ($m in $skipped) { & $say "Ostrzeżenie: folder nie istnieje, pominięto: $m" }
-            if (@($split.Existing).Count -eq 0) { $status = 'fail'; $note = 'żaden folder z listy nie istnieje' }
+            if ($Mode -eq 'backup') {
+                $split = Select-ExistingFolders -Folders @($Config.Folders) -Exists $PathExists
+                $skipped = @($split.Missing)
+                foreach ($m in $skipped) { & $say "Ostrzeżenie: folder nie istnieje, pominięto: $m" }
+                if (@($split.Existing).Count -eq 0) { $status = 'fail'; $note = 'żaden folder z listy nie istnieje' }
+                else {
+                    try { [void](& $Runner 'restic' @('unlock')) } catch { }
+                    try { $r = & $Runner 'restic' (Get-DailyBackupArgs -Config $Config -Folders @($split.Existing) -ComputerName $ComputerName) }
+                    catch { $r = @{ ExitCode = -1; Output = @($_.Exception.Message) } }
+                    $status = ConvertTo-DailyStatus -ExitCode $r.ExitCode
+                    $sum = ConvertFrom-ResticSummary -Lines $r.Output
+                    $added = $sum.AddedBytes; $snap = $sum.Snapshot
+                    if ($status -ne 'ok') { $note = Get-FailureNote -Lines $r.Output }
+                    if ($status -ne 'fail') {
+                        try {
+                            $s = & $Runner 'restic' @('snapshots', '--json', '--host', $ComputerName)
+                            $count = @(ConvertFrom-ResticSnapshots -Json (@($s.Output) -join "`n")).Count
+                        }
+                        catch { }
+                        if ($skipped.Count -gt 0) {
+                            $status = Get-WorseStatus -A $status -B 'warn'
+                            if (-not $note) { $note = "pominięto $($skipped.Count) nieistniejących folderów" }
+                        }
+                    }
+                }
+            }
+            elseif ($Mode -eq 'maintenance') {
+                $steps = @((Get-DailyForgetArgs -Config $Config -ComputerName $ComputerName), (Get-DailyCheckArgs))
+                foreach ($argList in $steps) {
+                    try { $r = & $Runner 'restic' $argList }
+                    catch { $r = @{ ExitCode = -1; Output = @($_.Exception.Message) } }
+                    $stepStatus = ConvertTo-DailyStatus -ExitCode $r.ExitCode
+                    if ($stepStatus -ne 'ok' -and -not $note) { $note = Get-FailureNote -Lines $r.Output }
+                    $status = Get-WorseStatus -A $status -B $stepStatus
+                }
+            }
             else {
-                try { [void](& $Runner 'restic' @('unlock')) } catch { }
-                try { $r = & $Runner 'restic' (Get-DailyBackupArgs -Config $Config -Folders @($split.Existing) -ComputerName $ComputerName) }
-                catch { $r = @{ ExitCode = -1; Output = @($_.Exception.Message) } }
-                $status = ConvertTo-DailyStatus -ExitCode $r.ExitCode
-                $sum = ConvertFrom-ResticSummary -Lines $r.Output
-                $added = $sum.AddedBytes; $snap = $sum.Snapshot
-                if ($status -ne 'ok') { $note = Get-FailureNote -Lines $r.Output }
-                if ($status -ne 'fail') {
-                    try {
-                        $s = & $Runner 'restic' @('snapshots', '--json', '--host', $ComputerName)
-                        $count = @(ConvertFrom-ResticSnapshots -Json (@($s.Output) -join "`n")).Count
-                    }
-                    catch { }
-                    if ($skipped.Count -gt 0) {
-                        $status = Get-WorseStatus -A $status -B 'warn'
-                        if (-not $note) { $note = "pominięto $($skipped.Count) nieistniejących folderów" }
-                    }
+                try { $r = & $Runner 'restic' (Get-DailyInitCheckArgs) } catch { $r = @{ ExitCode = -1; Output = @($_.Exception.Message) } }
+                if ($r.ExitCode -ne 0) {
+                    try { $r = & $Runner 'restic' @('init') } catch { $r = @{ ExitCode = -1; Output = @($_.Exception.Message) } }
+                    $status = ConvertTo-DailyStatus -ExitCode $r.ExitCode
+                    if ($status -ne 'ok') { $note = Get-FailureNote -Lines $r.Output }
                 }
             }
         }
@@ -393,7 +414,55 @@ function Invoke-DailyJob {
     $lr = New-LastRun -Status $status -Started $started -Finished $finished -AddedBytes $added -Snapshot $snap -Snapshots $count `
         -ResticVersion $ResticVersion -Skipped $skipped -Note (Hide-Secrets -Text $note -Secrets @($secrets)) -Previous $previous
     Save-LastRun -Path $lastPath -LastRun $lr
-    & $say "Kopia codzienna: $status$(if ($lr.note) { ' - ' + $lr.note })"
+    & $say "Kopia codzienna ($Mode): $status$(if ($lr.note) { ' - ' + $lr.note })"
     Write-DailyLog -Path (Join-Path $WorkDir 'daily.log') -Lines (@($log) | ForEach-Object { "$($started.ToString('yyyy-MM-dd HH:mm:ss')) $_" })
     return [pscustomobject]@{ ExitCode = $(if ($status -eq 'fail') { 1 } else { 0 }); Status = $status; LastRun = [pscustomobject]$lr }
+}
+
+function Get-DailyTaskSpecs {
+    param(
+        [Parameter(Mandatory)][string]$InstallDir,
+        [Parameter(Mandatory)][string]$Time,
+        [string]$MaintenanceDay = 'Sunday',
+        [string]$MaintenanceTime = '20:00'
+    )
+    $script = '{0}\Run-DailyBackup.ps1' -f $InstallDir.TrimEnd('\')
+    $base = '-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $script
+    return @(
+        [pscustomobject]@{
+            Name = 'WinResurect-Daily'; Execute = 'powershell.exe'; Arguments = "$base -Mode backup"
+            TriggerType = 'Daily'; At = $Time; DaysOfWeek = ''
+            StartWhenAvailable = $true; RestartCount = 2; RestartIntervalMinutes = 30
+            ExecutionTimeLimitHours = 6; AllowStartIfOnBatteries = $false; MultipleInstances = 'IgnoreNew'
+        },
+        [pscustomobject]@{
+            Name = 'WinResurect-Maintenance'; Execute = 'powershell.exe'; Arguments = "$base -Mode maintenance"
+            TriggerType = 'Weekly'; At = $MaintenanceTime; DaysOfWeek = $MaintenanceDay
+            StartWhenAvailable = $true; RestartCount = 0; RestartIntervalMinutes = 0
+            ExecutionTimeLimitHours = 6; AllowStartIfOnBatteries = $false; MultipleInstances = 'IgnoreNew'
+        }
+    )
+}
+
+function Register-DailyTasks {
+    # Tylko Windows.
+    param([Parameter(Mandatory)][object[]]$Specs)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    foreach ($s in $Specs) {
+        $action = New-ScheduledTaskAction -Execute $s.Execute -Argument $s.Arguments
+        if ($s.TriggerType -eq 'Daily') { $trigger = New-ScheduledTaskTrigger -Daily -At $s.At }
+        else { $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $s.DaysOfWeek -At $s.At }
+        $opts = @{ StartWhenAvailable = $true; ExecutionTimeLimit = (New-TimeSpan -Hours $s.ExecutionTimeLimitHours); MultipleInstances = $s.MultipleInstances }
+        if ($s.AllowStartIfOnBatteries) { $opts['AllowStartIfOnBatteries'] = $true }
+        if ($s.RestartCount -gt 0) { $opts['RestartCount'] = $s.RestartCount; $opts['RestartInterval'] = (New-TimeSpan -Minutes $s.RestartIntervalMinutes) }
+        $settings = New-ScheduledTaskSettingsSet @opts
+        Register-ScheduledTask -TaskName $s.Name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    }
+}
+
+function Unregister-DailyTasks {
+    # Tylko Windows.
+    foreach ($n in 'WinResurect-Daily', 'WinResurect-Maintenance') {
+        Unregister-ScheduledTask -TaskName $n -Confirm:$false -ErrorAction SilentlyContinue
+    }
 }

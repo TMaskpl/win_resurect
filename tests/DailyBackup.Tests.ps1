@@ -454,3 +454,97 @@ Describe 'Invoke-DailyJob (backup)' {
         ($script:calls | Where-Object { $_ -like 'restic*' }) | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Invoke-DailyJob (maintenance and init)' {
+    BeforeAll {
+        $script:usbVol2 = @([pscustomobject]@{ Drive = 'E:'; Label = 'BACKUP'; FileSystem = 'NTFS'; DriveType = 3 })
+        function Invoke-TestMode {
+            param([string]$Mode)
+            Invoke-DailyJob -Mode $Mode -Config (New-TestDailyConfig) -Volumes $script:usbVol2 -Runner $script:runner2 -WorkDir $script:work2 `
+                -Clock { [datetime]::SpecifyKind([datetime]'2026-10-14T10:30:00', 'Utc') } -ComputerName 'PC1'
+        }
+    }
+    BeforeEach {
+        $script:work2 = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:work2 | Out-Null
+        $script:calls2 = New-Object System.Collections.ArrayList
+        $script:catExit = 0; $script:checkExit = 0; $script:forgetExit = 0; $script:initExit = 0
+        $script:runner2 = {
+            param($Exe, $ArgList)
+            $script:calls2.Add("$Exe " + ($ArgList -join ' ')) | Out-Null
+            switch ($ArgList[0]) {
+                'cat' { return @{ ExitCode = $script:catExit; Output = @() } }
+                'init' { return @{ ExitCode = $script:initExit; Output = @() } }
+                'forget' { return @{ ExitCode = $script:forgetExit; Output = @() } }
+                'check' { return @{ ExitCode = $script:checkExit; Output = @('Fatal: pack abc: ID not found') } }
+                default { return @{ ExitCode = 0; Output = @() } }
+            }
+        }
+    }
+
+    It 'runs forget then check and writes last-maintenance.json' {
+        $r = Invoke-TestMode 'maintenance'
+        $r.ExitCode | Should -Be 0
+        @($script:calls2) | Should -Be @(
+            'restic forget --host PC1 --keep-daily 14 --keep-weekly 8 --keep-monthly 6 --prune',
+            'restic check --read-data-subset=5%')
+        (Read-LastRun -Path (Join-Path $script:work2 'last-maintenance.json')).status | Should -Be 'ok'
+        Test-Path (Join-Path $script:work2 'last-run.json') | Should -BeFalse
+    }
+
+    It 'takes the worst status of forget and check and notes the failing step' {
+        $script:checkExit = 1
+        $r = Invoke-TestMode 'maintenance'
+        $r.ExitCode | Should -Be 1
+        $r.LastRun.note | Should -Match 'ID not found'
+    }
+
+    It 'does not run init when the repository already exists' {
+        $r = Invoke-TestMode 'init'
+        $r.ExitCode | Should -Be 0
+        @($script:calls2) | Should -Be @('restic cat config')
+    }
+
+    It 'initializes a missing repository and fails when init fails' {
+        $script:catExit = 10
+        $r = Invoke-TestMode 'init'
+        $r.ExitCode | Should -Be 0
+        @($script:calls2) | Should -Be @('restic cat config', 'restic init')
+        $script:initExit = 1
+        $script:calls2.Clear()
+        (Invoke-TestMode 'init').ExitCode | Should -Be 1
+    }
+}
+
+Describe 'Get-DailyTaskSpecs' {
+    BeforeAll { $script:specs = @(Get-DailyTaskSpecs -InstallDir 'C:\ProgramData\WinResurect' -Time '12:30') }
+
+    It 'defines the daily backup and the weekly maintenance task' {
+        $script:specs.Count | Should -Be 2
+        @($script:specs | ForEach-Object { $_.Name }) | Should -Be @('WinResurect-Daily', 'WinResurect-Maintenance')
+    }
+
+    It 'runs scripts as files with a bypassed execution policy from the install folder' {
+        $d = $script:specs[0]
+        $d.Execute | Should -Be 'powershell.exe'
+        $d.Arguments | Should -Be '-NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\WinResurect\Run-DailyBackup.ps1" -Mode backup'
+        $script:specs[1].Arguments | Should -Match '-Mode maintenance'
+    }
+
+    It 'sets triggers and reliability options per the spec' {
+        $d = $script:specs[0]
+        $d.TriggerType | Should -Be 'Daily'
+        $d.At | Should -Be '12:30'
+        $d.StartWhenAvailable | Should -BeTrue
+        $d.AllowStartIfOnBatteries | Should -BeFalse
+        $d.RestartCount | Should -Be 2
+        $d.RestartIntervalMinutes | Should -Be 30
+        $d.ExecutionTimeLimitHours | Should -Be 6
+        $d.MultipleInstances | Should -Be 'IgnoreNew'
+        $m = $script:specs[1]
+        $m.TriggerType | Should -Be 'Weekly'
+        $m.DaysOfWeek | Should -Be 'Sunday'
+        $m.At | Should -Be '20:00'
+        $m.RestartCount | Should -Be 0
+    }
+}
