@@ -31,20 +31,27 @@ try {
     $env:RESTIC_REPOSITORY = $target.Repository
     $env:RESTIC_PASSWORD_FILE = Join-Path $workDir 'repo.pass'
     $restic = Join-Path $workDir 'restic.exe'
-    $json = & $restic snapshots --json --host $computer 2>$null
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $json = & $restic snapshots --json --host $computer 2>$null } finally { $ErrorActionPreference = $prevEap }
     $snaps = @(ConvertFrom-ResticSnapshots -Json ($json -join "`n") | Sort-Object Time -Descending)
     if ($snaps.Count -eq 0) { Write-Host 'Brak migawek w repozytorium.' -ForegroundColor Yellow; exit 2 }
     for ($i = 0; $i -lt $snaps.Count; $i++) { Write-Host ('{0,2}) {1}  {2}  {3}' -f ($i + 1), $snaps[$i].ShortId, $snaps[$i].Time.ToString('yyyy-MM-dd HH:mm'), ($snaps[$i].Paths -join ', ')) }
     $n = Read-Host 'Numer migawki (Enter = najnowsza)'
     $snap = if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $snaps.Count) { $snaps[[int]$n - 1] } else { $snaps[0] }
     $inc = Read-Host 'Folder lub plik do przywrócenia (pełna ścieżka z migawki; Enter = wszystko)'
-    $base = [Environment]::GetFolderPath('Desktop'); if (-not $base) { $base = $env:USERPROFILE }
+    # Folder docelowy musi leżeć poza kopiowanymi folderami (domyślny Pulpit często jest na liście).
+    $cands = @([Environment]::GetFolderPath('Desktop'), (Join-Path $env:USERPROFILE 'Downloads'), "$env:SystemDrive\") | Where-Object { $_ }
+    $defaultBase = Select-SafeRestoreBase -Candidates $cands -Folders @($cfg.Folders) -Now (Get-Date)
+    $custom = Read-Host $(if ($defaultBase) { "Folder, w którym utworzyć folder z odtworzonymi plikami (Enter = $defaultBase)" } else { 'Folder docelowy (poza kopiowanymi folderami)' })
+    $base = if ($custom) { $custom } else { $defaultBase }
+    if (-not $base) { Write-Host 'Błąd: nie wybrano folderu docelowego.' -ForegroundColor Red; exit 2 }
     $dest = New-RestoreTarget -Base $base -Now (Get-Date)
     if (-not (Test-RestoreTargetSafe -Target $dest -Folders @($cfg.Folders))) { Write-Host "Błąd: cel przywracania $dest koliduje z kopiowanymi folderami." -ForegroundColor Red; exit 2 }
     $inList = @(); if ($inc) { $inList = @($inc) }
     Write-Host "Przywracam migawkę $($snap.ShortId) do $dest ..."
-    & $restic @(Get-RestoreArgs -SnapshotId $snap.Id -Target $dest -Include $inList)
-    if ($LASTEXITCODE -ne 0) { Write-Host "Błąd: restic zakończył się kodem $LASTEXITCODE." -ForegroundColor Red; exit 1 }
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & $restic @(Get-RestoreArgs -SnapshotId $snap.Id -Target $dest -Include $inList); $rc = $LASTEXITCODE } finally { $ErrorActionPreference = $prevEap }
+    if ($rc -ne 0) { Write-Host "Błąd: restic zakończył się kodem $rc." -ForegroundColor Red; exit 1 }
     Write-Host "Gotowe. Pliki są w $dest (z pełną strukturą katalogów z migawki). Oryginały nie zostały zmienione." -ForegroundColor Green
 }
 finally {

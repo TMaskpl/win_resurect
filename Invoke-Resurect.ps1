@@ -7,6 +7,7 @@ param(
     [string]$Share,
     [string]$User,
     [string]$Folder,
+    [string]$Time,
     [switch]$Yes,
     [string]$Root
 )
@@ -46,9 +47,9 @@ if ($Action -ne 'image') {
     $files = @{ 'install-daily' = 'Install-DailyBackup.ps1'; 'status' = 'Get-DailyStatus.ps1'; 'restore' = 'Restore-DailyBackup.ps1'; 'remove-daily' = 'Remove-DailyBackup.ps1' }
     $splat = @{ Root = $root }
     if ($Action -eq 'install-daily') {
-        foreach ($k in 'Target', 'Label', 'Share', 'User', 'Folder') { if ((Get-Variable $k).Value) { $splat[$k] = (Get-Variable $k).Value } }
+        foreach ($k in 'Target', 'Label', 'Share', 'User', 'Folder', 'Time') { if ((Get-Variable $k).Value) { $splat[$k] = (Get-Variable $k).Value } }
     }
-    if ($Yes -and ($Action -eq 'install-daily' -or $Action -eq 'remove-daily')) { $splat['Yes'] = $true }
+    if ($Yes -and $Action -eq 'remove-daily') { $splat['Yes'] = $true }
     & ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root $files[$Action])))) @splat
     exit 0
 }

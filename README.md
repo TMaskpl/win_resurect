@@ -58,7 +58,7 @@ Uruchamiaj narzędzie z dysku lokalnego (np. `C:\win_resurect`). Po podniesieniu
 Druga funkcja narzędzia: zadanie w Harmonogramie Windows, które **codziennie, różnicowo** kopiuje foldery z pliku `daily.json` na dysk USB (rozpoznawany po etykiecie) albo udział SMB. Używa [restic](https://restic.net) (szyfrowanie, deduplikacja, migawki VSS dla otwartych plików).
 
 ```bat
-Start.cmd -Action install-daily -Target usb -Label BACKUP
+Start.cmd -Action install-daily -Target usb -Label BACKUP [-Time 12:30] [-Folder WinResurectDaily]
 Start.cmd -Action install-daily -Target smb -Share \\nas\share -User uzytkownik
 Start.cmd -Action status
 Start.cmd -Action restore

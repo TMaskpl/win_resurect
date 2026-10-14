@@ -8,6 +8,14 @@ function Get-ConfigValue {
     return $Default
 }
 
+function ConvertTo-ResticFolder {
+    # Windows PowerShell 5.1 psuje argument z końcowym backslashem i spacją ("D:\Dane Firmy\"), więc go obcinamy (korzeń dysku zostaje).
+    param([Parameter(Mandatory)][string]$Path)
+    $p = $Path.Trim()
+    if ($p.Length -gt 3) { $p = $p.TrimEnd('\') }
+    return $p
+}
+
 function ConvertTo-IntOrNull {
     param($Value)
     $i = 0
@@ -26,6 +34,7 @@ function ConvertTo-DailyConfig {
     foreach ($f in @(Get-ConfigValue $Raw 'folders' @())) {
         $s = "$f".Trim()
         if (-not $s) { continue }
+        $s = ConvertTo-ResticFolder -Path $s
         $key = $s.TrimEnd('\').ToLower()
         if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $folders += $s }
     }
@@ -62,6 +71,7 @@ function Get-DailyTargetErrors {
     if ($Target.Type -eq 'smb') {
         if ($Target.Share -notmatch '^\\\\[^\\]+\\[^\\]+') { $e += 'target.share: podaj udział w postaci \\serwer\udział' }
         if (-not $Target.User) { $e += 'target.user: podaj użytkownika udziału' }
+        elseif ($Target.User -match '[\x00-\x1f]') { $e += 'target.user: niedozwolone znaki sterujące' }
     }
     return $e
 }
@@ -135,7 +145,7 @@ function Get-DailyBackupArgs {
     param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string[]]$Folders, [Parameter(Mandatory)][string]$ComputerName)
     $a = @('backup', '--json', '--use-fs-snapshot', '--host', $ComputerName)
     foreach ($e in @($Config.Excludes)) { $a += @('--exclude', $e) }
-    $a += @($Folders)
+    $a += @($Folders | ForEach-Object { ConvertTo-ResticFolder -Path $_ })
     return $a
 }
 
@@ -180,10 +190,23 @@ function ConvertFrom-ResticSummary {
     return @{ AddedBytes = $added; Snapshot = $snap }
 }
 
+function Expand-JsonItems {
+    # Windows PowerShell 5.1 zwraca tablicę JSON jako jeden obiekt; PowerShell 7 wylicza elementy. Obsługujemy oba.
+    param($Parsed)
+    $out = @()
+    foreach ($x in @($Parsed)) {
+        if ($null -eq $x) { continue }
+        if ($x -is [System.Array]) { foreach ($y in $x) { if ($null -ne $y) { $out += $y } } }
+        else { $out += $x }
+    }
+    return $out
+}
+
 function ConvertFrom-ResticSnapshots {
     param([string]$Json)
     if (-not $Json -or -not $Json.Trim()) { return @() }
-    try { $items = @($Json | ConvertFrom-Json -ErrorAction Stop) } catch { return @() }
+    try { $parsed = $Json | ConvertFrom-Json -ErrorAction Stop } catch { return @() }
+    $items = @(Expand-JsonItems -Parsed $parsed)
     $out = @()
     foreach ($i in $items) {
         $raw = [string](Get-ConfigValue $i 'time' '')
@@ -274,15 +297,21 @@ function Save-LastRun {
 function Read-LastRun {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    try { return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop) }
+    try { $o = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }
     catch { return $null }
+    if ($o -isnot [System.Management.Automation.PSCustomObject] -or -not $o.PSObject.Properties['status']) { return $null }
+    return $o
 }
 
 function Get-DailyStaleness {
     param($LastRun, [Parameter(Mandatory)][datetime]$Now, [int]$MaxHours = 48)
-    if (-not $LastRun -or -not $LastRun.PSObject.Properties['last_success'] -or -not $LastRun.last_success) { return 'never' }
-    $t = [datetime]::MinValue
-    if (-not [datetime]::TryParse([string]$LastRun.last_success, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$t)) { return 'never' }
+    $v = Get-ConfigValue $LastRun 'last_success' ''
+    if ($v -is [datetime]) { $t = $v }
+    else {
+        if (-not "$v") { return 'never' }
+        $t = [datetime]::MinValue
+        if (-not [datetime]::TryParse([string]$v, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$t)) { return 'never' }
+    }
     if (($Now.ToUniversalTime() - $t.ToUniversalTime()).TotalHours -gt $MaxHours) { return 'stale' }
     return 'fresh'
 }
@@ -291,13 +320,15 @@ function Get-DailyStatusText {
     param($LastRun, [Parameter(Mandatory)][datetime]$Now)
     if (-not $LastRun) { return 'Kopia codzienna: brak danych o przebiegach (jeszcze się nie wykonała).' }
     $stale = Get-DailyStaleness -LastRun $LastRun -Now $Now
+    $ls = Get-ConfigValue $LastRun 'last_success' ''
     $lines = @(
-        "Ostatni przebieg: $($LastRun.status) ($($LastRun.finished))",
-        "Ostatni sukces:   $(if ($LastRun.last_success) { $LastRun.last_success } else { 'brak' })",
-        "Czas: $($LastRun.duration_s) s, dodano: $(Format-Size ([long]$LastRun.added_bytes)), migawek: $($LastRun.snapshots)"
+        "Ostatni przebieg: $(Get-ConfigValue $LastRun 'status' '?') ($(Get-ConfigValue $LastRun 'finished' '?'))",
+        "Ostatni sukces:   $(if ($ls) { $ls } else { 'brak' })",
+        "Czas: $(Get-ConfigValue $LastRun 'duration_s' 0) s, dodano: $(Format-Size ([long](Get-ConfigValue $LastRun 'added_bytes' 0))), migawek: $(Get-ConfigValue $LastRun 'snapshots' 0)"
     )
-    if ($LastRun.note) { $lines += "Uwagi: $($LastRun.note)" }
-    $sk = @($LastRun.skipped_folders)
+    $note = Get-ConfigValue $LastRun 'note' ''
+    if ($note) { $lines += "Uwagi: $note" }
+    $sk = @(Get-ConfigValue $LastRun 'skipped_folders' @())
     if ($sk.Count -gt 0) { $lines += "Pominięte foldery: $($sk -join ', ')" }
     if ($stale -eq 'stale') { $lines += 'UWAGA: kopia NIEAKTUALNA (ostatni sukces starszy niż 48 godzin).' }
     elseif ($stale -eq 'never') { $lines += 'UWAGA: kopia NIEAKTUALNA (brak udanego przebiegu).' }
@@ -333,6 +364,7 @@ function Invoke-DailyJob {
         [string]$ResticVersion = ''
     )
     $started = & $Clock
+    try { Write-DailyLog -Path (Join-Path $WorkDir 'daily.log') -Lines @("$($started.ToString('yyyy-MM-dd HH:mm:ss')) Start ($Mode)") } catch { }
     $log = New-Object System.Collections.ArrayList
     $secrets = New-Object System.Collections.ArrayList
     $say = { param($m) [void]$log.Add((Hide-Secrets -Text $m -Secrets @($secrets))) }
@@ -404,6 +436,10 @@ function Invoke-DailyJob {
                 }
             }
         }
+    }
+    catch {
+        $status = 'fail'
+        $note = "nieoczekiwany błąd: $($_.Exception.Message)"
     }
     finally {
         if ($null -eq $oldRepo) { Remove-Item Env:RESTIC_REPOSITORY -ErrorAction SilentlyContinue } else { $env:RESTIC_REPOSITORY = $oldRepo }
@@ -537,6 +573,7 @@ function Set-RestrictedAcl {
     $isDir = (Get-Item -LiteralPath $Path).PSIsContainer
     $acl = if ($isDir) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
     $acl.SetAccessRuleProtection($true, $false)
+    try { $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'))) } catch { }
     $inherit = if ($isDir) { 'ContainerInherit,ObjectInherit' } else { 'None' }
     foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
         $id = New-Object System.Security.Principal.SecurityIdentifier($sid)
@@ -564,16 +601,74 @@ function New-DailyConfigJson {
 function Update-DailyConfigJson {
     param(
         [Parameter(Mandatory)][string]$Json, [Parameter(Mandatory)][string]$Type, [string]$Label = '',
-        [string]$Share = '', [string]$User = '', [string]$Folder = 'WinResurectDaily', [string]$Time = '12:30'
+        [string]$Share = '', [string]$User = '', [string]$Folder = '', [string]$Time = ''
     )
     $o = $Json | ConvertFrom-Json
+    $oldFolder = [string](Get-ConfigValue (Get-ConfigValue $o 'target') 'folder' '')
+    $oldTime = [string](Get-ConfigValue (Get-ConfigValue $o 'schedule') 'time' '')
+    $f = if ($Folder) { $Folder } elseif ($oldFolder) { $oldFolder } else { 'WinResurectDaily' }
+    $tm = if ($Time) { $Time } elseif ($oldTime) { $oldTime } else { '12:30' }
     $target = [ordered]@{ type = $Type }
     if ($Type -eq 'usb') { $target['label'] = $Label } else { $target['share'] = $Share; $target['user'] = $User }
-    $target['folder'] = $Folder
+    $target['folder'] = $f
     $o | Add-Member -NotePropertyName target -NotePropertyValue ([pscustomobject]$target) -Force
-    $sch = [pscustomobject]@{ time = $Time }
-    $o | Add-Member -NotePropertyName schedule -NotePropertyValue $sch -Force
+    $o | Add-Member -NotePropertyName schedule -NotePropertyValue ([pscustomobject]@{ time = $tm }) -Force
     return ($o | ConvertTo-Json -Depth 6)
+}
+
+function ConvertTo-SingleQuoted {
+    # Bezpieczny literał PowerShell w apostrofach (podwaja także typograficzne apostrofy, które parser traktuje jak apostrof).
+    param([string]$Text)
+    return "'" + [regex]::Replace($Text, "['\u2018\u2019\u201A\u201B]", '$0$0') + "'"
+}
+
+function Get-SetCredScript {
+    param([Parameter(Mandatory)][string]$TmpPath, [Parameter(Mandatory)][string]$CredPath, [Parameter(Mandatory)][string]$User)
+    $lines = @(
+        "`$ErrorActionPreference = 'Stop'",
+        ('$p = [System.IO.File]::ReadAllText({0}, [System.Text.Encoding]::UTF8)' -f (ConvertTo-SingleQuoted $TmpPath)),
+        '$sec = ConvertTo-SecureString $p -AsPlainText -Force',
+        ('Set-Content -LiteralPath {0} -Value @({1}, (ConvertFrom-SecureString $sec)) -Encoding UTF8' -f (ConvertTo-SingleQuoted $CredPath), (ConvertTo-SingleQuoted $User)),
+        ('Remove-Item -LiteralPath {0} -Force' -f (ConvertTo-SingleQuoted $TmpPath))
+    )
+    return ($lines -join "`r`n")
+}
+
+function Get-AsSystemArgument {
+    # Harmonogram nie używa powłoki, więc przekierowanie `*>` działa tylko wewnątrz -Command.
+    param([Parameter(Mandatory)][string]$Script, [Parameter(Mandatory)][string]$Log)
+    $cmd = '& {0} *> {1}; exit $LASTEXITCODE' -f (ConvertTo-SingleQuoted $Script), (ConvertTo-SingleQuoted $Log)
+    return ('-NoProfile -ExecutionPolicy Bypass -Command "{0}"' -f $cmd)
+}
+
+function Test-TrustedOwnerSid {
+    param([string]$Sid)
+    return (@('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') -contains $Sid)
+}
+
+function Get-ResticExeName {
+    param([Parameter(Mandatory)][string]$Version)
+    return ('restic_{0}_windows_amd64.exe' -f $Version)
+}
+
+function Get-InstallPreflightErrors {
+    param([bool]$IsAdmin = $true, [bool]$Is64Bit = $true, [bool]$TargetOk = $true, [string]$TargetReason = '', [bool]$WorkDirTrusted = $true, [string]$WorkDir = '')
+    $e = @()
+    if (-not $IsAdmin) { $e += 'Uruchom jako administrator (Start.cmd robi to automatycznie).' }
+    if (-not $Is64Bit) { $e += 'Wymagany system 64-bitowy (restic jest dostarczany tylko w wersji amd64).' }
+    if (-not $TargetOk) { $e += "Cel kopii niedostępny: $TargetReason" }
+    if (-not $WorkDirTrusted) { $e += "Katalog $WorkDir istnieje i nie należy do SYSTEM ani Administratorów. Usuń go albo przejmij własność i uruchom instalację ponownie." }
+    return $e
+}
+
+function Select-SafeRestoreBase {
+    param([string[]]$Candidates, [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Folders, [Parameter(Mandatory)][datetime]$Now)
+    foreach ($c in $Candidates) {
+        if (-not $c) { continue }
+        $t = New-RestoreTarget -Base $c -Now $Now
+        if (Test-RestoreTargetSafe -Target $t -Folders $Folders) { return $c }
+    }
+    return $null
 }
 
 function Invoke-AsSystem {
@@ -583,7 +678,7 @@ function Invoke-AsSystem {
     $log = '{0}\{1}.log' -f $WorkDir, $Name
     Set-Content -LiteralPath $script -Value $ScriptText -Encoding UTF8
     Set-RestrictedAcl -Path $script
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$script`" *> `"$log`""
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (Get-AsSystemArgument -Script $script -Log $log)
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     Register-ScheduledTask -TaskName $Name -Action $action -Principal $principal -Force | Out-Null
     try {

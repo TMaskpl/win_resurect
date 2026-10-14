@@ -39,13 +39,24 @@ $runner = {
 $readCred = {
     $f = Join-Path $workDir 'smb.cred'
     if (-not (Test-Path -LiteralPath $f)) { return $null }
-    $lines = @(Get-Content -LiteralPath $f)
+    $lines = @(Get-Content -LiteralPath $f -Encoding UTF8)
     if ($lines.Count -lt 2) { return $null }
     return (New-Object System.Management.Automation.PSCredential($lines[0], (ConvertTo-SecureString $lines[1])))
 }
 $version = ''
 try { $version = ((& $resticPath version 2>&1) -join ' ') -replace '^restic\s+([\d.]+).*$', '$1' } catch { }
 
-$result = Invoke-DailyJob -Mode $Mode -Config $cfg -Volumes @(Get-LocalVolumes) -Runner $runner -WorkDir $workDir `
-    -ReadSmbCredential $readCred -ResticVersion $version
-exit $result.ExitCode
+try {
+    $result = Invoke-DailyJob -Mode $Mode -Config $cfg -Volumes @(Get-LocalVolumes) -Runner $runner -WorkDir $workDir `
+        -ReadSmbCredential $readCred -ResticVersion $version
+    exit $result.ExitCode
+}
+catch {
+    # Ostatnia siatka bezpieczeństwa: nawet nieprzewidziany wyjątek ma zostawić ślad `fail`, a nie stary status `ok`.
+    $now = Get-Date
+    $lr = New-LastRun -Status fail -Started $now -Finished $now -Note ("nieoczekiwany błąd: " + $_.Exception.Message) `
+        -Previous (Read-LastRun -Path (Join-Path $workDir 'last-run.json'))
+    Save-LastRun -Path (Join-Path $workDir 'last-run.json') -LastRun $lr
+    Write-DailyLog -Path (Join-Path $workDir 'daily.log') -Lines @("$($now.ToString('yyyy-MM-dd HH:mm:ss')) Nieoczekiwany błąd: $(Format-Note -Text $_.Exception.Message)")
+    exit 1
+}

@@ -23,7 +23,9 @@ Start.cmd -Action install-daily -Target smb -Share \\nas\share -User uzytkownik
 4. Otwiera `daily.json` w Notatniku: wpisz foldery do kopiowania, zapisz i zamknij.
 5. Rejestruje zadania i od razu uruchamia pierwszą kopię (postęp widać na ekranie).
 
-Ponowne uruchomienie `install-daily` aktualizuje cel i godzinę, a zachowuje listę folderów, wykluczenia, retencję, repozytorium i hasło repozytorium.
+Ponowne uruchomienie `install-daily` aktualizuje cel, a zachowuje listę folderów, wykluczenia, retencję, repozytorium i hasło repozytorium. Godzinę (`-Time 14:30`) i folder repozytorium (`-Folder Nazwa`) zmieniasz tylko, gdy podasz je jawnie; w przeciwnym razie zostają dotychczasowe. Instalacja jest interaktywna (hasło repozytorium trzeba zapisać w KeePass), więc nie ma trybu `-Yes`.
+
+Instalator odmawia pracy, gdy `C:\ProgramData\WinResurect` już istnieje i nie należy do SYSTEM ani Administratorów (ochrona przed podłożeniem plików uruchamianych jako SYSTEM). `restic.exe` jest zawsze instalowany ze zweryfikowanego archiwum, nigdy z istniejącego pliku.
 
 ## Plik `daily.json`
 
@@ -60,7 +62,7 @@ Pokazuje wynik ostatniego przebiegu, czas, dodany rozmiar, liczbę migawek i pom
 Start.cmd -Action restore
 ```
 
-Pokazuje listę migawek, pozwala wskazać migawkę oraz folder lub plik, i przywraca je do **nowego folderu na pulpicie** (`Przywrocone_<data>`), z pełną strukturą katalogów z migawki. Oryginały nigdy nie są nadpisywane (cel kolidujący z kopiowanym folderem jest odrzucany). Przy SMB narzędzie pyta o hasło ponownie. Na tym samym komputerze narzędzie czyta hasło repozytorium z `repo.pass`. Po awarii, na innym komputerze, użyj `restic` ręcznie (`restic -r <repozytorium> restore latest --target <folder>`) z hasłem zapisanym w KeePass.
+Pokazuje listę migawek, pozwala wskazać migawkę oraz folder lub plik, i przywraca je do **nowego folderu** `Przywrocone_<data>` z pełną strukturą katalogów z migawki. Folder nadrzędny musi leżeć poza kopiowanymi folderami: narzędzie proponuje pierwszy bezpieczny (Pulpit, Pobrane lub korzeń dysku systemowego) i pozwala podać własny. Oryginały nigdy nie są nadpisywane (cel kolidujący z kopiowanym folderem jest odrzucany). Przy SMB narzędzie pyta o hasło ponownie. Na tym samym komputerze narzędzie czyta hasło repozytorium z `repo.pass`. Po awarii, na innym komputerze, użyj `restic` ręcznie (`restic -r <repozytorium> restore latest --target <folder>`) z hasłem zapisanym w KeePass.
 
 ## Usuwanie
 
@@ -74,7 +76,7 @@ Usuwa zadania i `C:\ProgramData\WinResurect\` (razem z hasłem repozytorium). **
 
 | Objaw | Co zrobić |
 |---|---|
-| „cel niedostępny: nie znaleziono dysku o etykiecie…” | podłącz dysk; sprawdź etykietę w Eksploratorze; zadanie powtórzy próbę dwa razy co 30 minut |
+| „cel niedostępny: nie znaleziono dysku o etykiecie…” | podłącz dysk; sprawdź etykietę w Eksploratorze; zadanie jest skonfigurowane do ponawiania (do dwóch prób co 30 minut; działanie przy niezerowym kodzie wyjścia zostanie potwierdzone na Windows), a w razie potrzeby uruchom `schtasks /run /tn WinResurect-Daily` |
 | „więcej niż jeden dysk o etykiecie…” | nadaj dyskom unikalne etykiety |
 | „NIEAKTUALNA” w Statusie | zobacz `daily.log` i `last-run.json`; uruchom `schtasks /run /tn WinResurect-Daily` |
 | `fail` i komunikat o `daily.json` | popraw plik (ukośniki podwojone, godzina `GG:MM`, ścieżki bezwzględne) |

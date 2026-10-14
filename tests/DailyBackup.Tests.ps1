@@ -308,11 +308,12 @@ Describe 'Invoke-DailyJob (backup)' {
         $script:usbVol = @([pscustomobject]@{ Drive = 'E:'; Label = 'BACKUP'; FileSystem = 'NTFS'; DriveType = 3 })
         $script:smbTarget = @{ Type = 'smb'; Label = ''; Share = '\\nas\share'; User = 'uzytkownik'; Folder = 'WinResurectDaily' }
         function Invoke-TestJob {
-            param($Config, [object[]]$Volumes = $script:usbVol, [string[]]$Existing = @('C:\Users\Jan\Documents'), $Credential = $null)
+            param($Config, [object[]]$Volumes = $script:usbVol, [string[]]$Existing = @('C:\Users\Jan\Documents'), $Credential = $null, [scriptblock]$Reader = $null)
             $script:existing = $Existing
             $exists = { param($p) $script:existing -contains $p }
             $cred = $Credential
             $reader = { $cred }.GetNewClosure()
+            if ($Reader) { $reader = $Reader }
             Invoke-DailyJob -Mode backup -Config $Config -Volumes $Volumes -Runner $script:runner -WorkDir $script:work `
                 -ReadSmbCredential $reader -Connector $script:connector -Disconnector $script:disconnector `
                 -PathExists $exists -Clock { [datetime]::SpecifyKind([datetime]'2026-10-14T10:30:00', 'Utc') } `
@@ -666,5 +667,192 @@ Describe 'entry scripts for the daily backup' {
         $pwsh = (Get-Process -Id $PID).Path
         & $pwsh -NoProfile -File (Join-Path $script:root 'Install-DailyBackup.ps1') -Root $script:root -Target usb -Label 'zły/label' *> $null
         $LASTEXITCODE | Should -Be 2
+    }
+}
+
+
+Describe 'review fixes: robustness of the job' {
+    BeforeAll {
+        $script:usbVol3 = @([pscustomobject]@{ Drive = 'E:'; Label = 'BACKUP'; FileSystem = 'NTFS'; DriveType = 3 })
+        function Invoke-RobustJob {
+            param([scriptblock]$Reader = { $null }, [scriptblock]$Connector = $null, $Config = (New-TestDailyConfig))
+            if (-not $Connector) { $Connector = { param($s, $u, $p) @{ ExitCode = 0; Output = @() } } }
+            Invoke-DailyJob -Mode backup -Config $Config -Volumes $script:usbVol3 -Runner $script:runner3 -WorkDir $script:work3 `
+                -ReadSmbCredential $Reader -Connector $Connector -PathExists { param($p) $true } `
+                -Clock { [datetime]::SpecifyKind([datetime]'2026-10-14T10:30:00', 'Utc') } -ComputerName 'PC1'
+        }
+    }
+    BeforeEach {
+        $script:work3 = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:work3 | Out-Null
+        $script:runner3 = { param($Exe, $ArgList) @{ ExitCode = 0; Output = @('{"message_type":"summary","data_added":1,"snapshot_id":"abcdef012345"}') } }
+    }
+
+    It 'records an unexpected exception as a failed run (and keeps the previous last_success)' {
+        $ok = Invoke-RobustJob
+        $ok.Status | Should -Be 'ok'
+        $good = (Read-LastRun -Path (Join-Path $script:work3 'last-run.json')).last_success
+        $smb = New-TestDailyConfig -Target @{ Type = 'smb'; Label = ''; Share = '\\nas\share'; User = 'u'; Folder = 'WinResurectDaily' }
+        $r = Invoke-RobustJob -Config $smb -Reader { throw 'DPAPI: nie można odszyfrować' }
+        $r.ExitCode | Should -Be 1
+        $r.Status | Should -Be 'fail'
+        $lr = Read-LastRun -Path (Join-Path $script:work3 'last-run.json')
+        $lr.status | Should -Be 'fail'
+        $lr.note | Should -Match 'nieoczekiwany błąd'
+        $lr.last_success | Should -Be $good
+        (Get-Content -LiteralPath (Join-Path $script:work3 'daily.log') -Raw) | Should -Match 'nieoczekiwany'
+    }
+
+    It 'records an exception from the connector as a failed run' {
+        $smb = New-TestDailyConfig -Target @{ Type = 'smb'; Label = ''; Share = '\\nas\share'; User = 'u'; Folder = 'WinResurectDaily' }
+        $cred = New-Object System.Management.Automation.PSCredential('u', (ConvertTo-SecureString 'Sekret1' -AsPlainText -Force))
+        $r = Invoke-RobustJob -Config $smb -Reader { $cred }.GetNewClosure() -Connector { throw 'csc.exe zablokowany przez antywirus' }
+        $r.ExitCode | Should -Be 1
+        $r.LastRun.note | Should -Match 'antywirus'
+        $r.LastRun.note | Should -Not -Match 'Sekret1'
+    }
+
+    It 'writes a start line to the log immediately so that pollers see activity' {
+        Invoke-RobustJob | Out-Null
+        (Get-Content -LiteralPath (Join-Path $script:work3 'daily.log') -Raw) | Should -Match 'Start'
+    }
+}
+
+Describe 'review fixes: status tolerates damaged files' {
+    It 'treats a last-run file with the wrong shape as missing' {
+        $p = Join-Path $TestDrive 'lr.json'
+        foreach ($bad in '{}', '"x"', '[]', '42', 'null') {
+            Set-Content -LiteralPath $p -Value $bad -Encoding UTF8
+            Read-LastRun -Path $p | Should -BeNullOrEmpty
+        }
+    }
+
+    It 'prints a status text for a partial last-run without throwing' {
+        $partial = [pscustomobject]@{ status = 'ok' }
+        { Get-DailyStatusText -LastRun $partial -Now ([datetime]'2026-10-14T12:00:00') } | Should -Not -Throw
+        (Get-DailyStatusText -LastRun $partial -Now ([datetime]'2026-10-14T12:00:00')) | Should -Match 'NIEAKTUALNA'
+        { Get-DailyStaleness -LastRun $partial -Now ([datetime]'2026-10-14T12:00:00') } | Should -Not -Throw
+    }
+
+    It 'accepts last_success parsed as a datetime (PowerShell 7) as well as a string' {
+        $now = [datetime]::SpecifyKind([datetime]'2026-10-14T12:00:00', 'Utc')
+        $asDate = [pscustomobject]@{ status = 'ok'; last_success = [datetime]::SpecifyKind([datetime]'2026-10-14T10:00:00', 'Utc') }
+        Get-DailyStaleness -LastRun $asDate -Now $now | Should -Be 'fresh'
+        $asText = [pscustomobject]@{ status = 'ok'; last_success = '2026-10-10T10:00:00Z' }
+        Get-DailyStaleness -LastRun $asText -Now $now | Should -Be 'stale'
+    }
+}
+
+Describe 'review fixes: JSON lists in Windows PowerShell 5.1' {
+    It 'expands a list that arrives wrapped in one array (5.1 behaviour) as well as flat lists' {
+        $a = [pscustomobject]@{ n = 1 }; $b = [pscustomobject]@{ n = 2 }
+        @(Expand-JsonItems -Parsed (, @($a, $b))).Count | Should -Be 2
+        @(Expand-JsonItems -Parsed @($a, $b)).Count | Should -Be 2
+        @(Expand-JsonItems -Parsed $a).Count | Should -Be 1
+        @(Expand-JsonItems -Parsed $null).Count | Should -Be 0
+    }
+
+    It 'reads no snapshots from a literal null' {
+        @(ConvertFrom-ResticSnapshots -Json 'null').Count | Should -Be 0
+    }
+}
+
+Describe 'review fixes: paths and config updates' {
+    It 'normalizes trailing backslashes (restic receives them badly from Windows PowerShell 5.1)' {
+        ConvertTo-ResticFolder -Path 'D:\Dane Firmy\' | Should -Be 'D:\Dane Firmy'
+        ConvertTo-ResticFolder -Path 'D:\' | Should -Be 'D:\'
+        ConvertTo-ResticFolder -Path '\\nas\share\x\' | Should -Be '\\nas\share\x'
+        $c = Read-DailyConfig -Path (Write-TestJson 'tb.json' (New-RawConfig @{ folders = @('D:\Dane Firmy\') }))
+        @($c.Folders) | Should -Be @('D:\Dane Firmy')
+        $a = @(Get-DailyBackupArgs -Config (New-TestDailyConfig) -Folders @('D:\Dane Firmy\') -ComputerName 'PC1')
+        $a[-1] | Should -Be 'D:\Dane Firmy'
+    }
+
+    It 'keeps time and folder on update when they are not given, and overrides them when they are' {
+        $old = '{ "target": { "type": "usb", "label": "STARY", "folder": "Kopie" }, "folders": ["C:\\Dane"], "schedule": { "time": "07:00" } }'
+        $kept = Update-DailyConfigJson -Json $old -Type usb -Label 'NOWY'
+        $p = Join-Path $TestDrive 'keep.json'
+        Set-Content -LiteralPath $p -Value $kept -Encoding UTF8
+        $c = Read-DailyConfig -Path $p
+        $c.Target.Label | Should -Be 'NOWY'
+        $c.Target.Folder | Should -Be 'Kopie'
+        $c.Time | Should -Be '07:00'
+        $changed = Update-DailyConfigJson -Json $old -Type usb -Label 'NOWY' -Time '14:15' -Folder 'Inny'
+        Set-Content -LiteralPath $p -Value $changed -Encoding UTF8
+        $c2 = Read-DailyConfig -Path $p
+        $c2.Time | Should -Be '14:15'
+        $c2.Target.Folder | Should -Be 'Inny'
+    }
+
+    It 'rejects control characters in the SMB user name' {
+        { Test-DailyTargetParams -Target smb -Share '\\nas\share' -User ("jan" + [char]7) } | Should -Throw
+        (Test-DailyTargetParams -Target smb -Share '\\nas\share' -User "o'neil").User | Should -Be "o'neil"
+    }
+}
+
+Describe 'review fixes: the SYSTEM script and its quoting' {
+    It 'quotes any text into a PowerShell single-quoted literal that round-trips' {
+        foreach ($text in @("zwykły", "o'neil", 'a$b`c"d', ("smart " + [char]0x2019 + " quote"), "x'); Write-Host pwn; ('")) {
+            $q = ConvertTo-SingleQuoted -Text $text
+            $back = & ([scriptblock]::Create($q))
+            $back | Should -Be $text
+        }
+    }
+
+    It 'builds a SetCred script that stops on errors, reads the password as UTF-8 untrimmed, and cannot be injected' {
+        foreach ($user in @('jan', "o'neil", "x'); Write-Host pwn; ('")) {
+            $text = Get-SetCredScript -TmpPath 'C:\ProgramData\WinResurect\smb.tmp' -CredPath 'C:\ProgramData\WinResurect\smb.cred' -User $user
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
+            @($errors).Count | Should -Be 0
+            $cmds = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() })
+            $cmds | Should -Not -Contain 'Write-Host'
+            ($cmds | Sort-Object -Unique) | Should -Be @('ConvertFrom-SecureString', 'ConvertTo-SecureString', 'Remove-Item', 'Set-Content')
+            $text | Should -Match "ErrorActionPreference = 'Stop'"
+            $text | Should -Match 'ReadAllText'
+            $text | Should -Not -Match '\.Trim\(\)'
+        }
+    }
+
+    It 'builds the scheduled-task argument so that the script log is really written and the exit code is passed on' {
+        $arg = Get-AsSystemArgument -Script 'C:\ProgramData\WinResurect\x.ps1' -Log 'C:\ProgramData\WinResurect\x.log'
+        $arg | Should -Match '^-NoProfile -ExecutionPolicy Bypass -Command "'
+        $arg | Should -Match "& 'C:\\ProgramData\\WinResurect\\x\.ps1' \*> 'C:\\ProgramData\\WinResurect\\x\.log'"
+        $arg | Should -Match 'exit \$LASTEXITCODE'
+        $arg | Should -Not -Match ' -File '
+    }
+}
+
+Describe 'review fixes: install safety' {
+    It 'trusts only SYSTEM, Administrators and TrustedInstaller as owners (by SID, not by localized name)' {
+        Test-TrustedOwnerSid -Sid 'S-1-5-18' | Should -BeTrue
+        Test-TrustedOwnerSid -Sid 'S-1-5-32-544' | Should -BeTrue
+        Test-TrustedOwnerSid -Sid 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' | Should -BeTrue
+        Test-TrustedOwnerSid -Sid 'S-1-5-21-111-222-333-1001' | Should -BeFalse
+        Test-TrustedOwnerSid -Sid '' | Should -BeFalse
+    }
+
+    It 'names the exact restic executable inside the archive' {
+        Get-ResticExeName -Version '0.19.1' | Should -Be 'restic_0.19.1_windows_amd64.exe'
+    }
+
+    It 'collects every install precondition before anything is changed' {
+        @(Get-InstallPreflightErrors -IsAdmin $true -Is64Bit $true -TargetOk $true).Count | Should -Be 0
+        $e = @(Get-InstallPreflightErrors -IsAdmin $false -Is64Bit $false -TargetOk $false -TargetReason 'cel niedostępny: brak dysku' -WorkDirTrusted $false -WorkDir 'C:\ProgramData\WinResurect')
+        ($e -join ' ') | Should -Match 'administrator'
+        ($e -join ' ') | Should -Match '64'
+        ($e -join ' ') | Should -Match 'cel niedostępny: brak dysku'
+        ($e -join ' ') | Should -Match 'C:\\ProgramData\\WinResurect'
+        $e.Count | Should -Be 4
+    }
+}
+
+Describe 'review fixes: restore target outside the backed-up folders' {
+    It 'picks the first candidate base that does not collide with the backed-up folders' {
+        $folders = @('C:\Users\Jan\Documents', 'C:\Users\Jan\Desktop')
+        $now = [datetime]'2026-10-14T13:05:00'
+        Select-SafeRestoreBase -Candidates @('C:\Users\Jan\Desktop', 'C:\') -Folders $folders -Now $now | Should -Be 'C:\'
+        Select-SafeRestoreBase -Candidates @('C:\Users\Jan\Downloads', 'C:\') -Folders $folders -Now $now | Should -Be 'C:\Users\Jan\Downloads'
+        Select-SafeRestoreBase -Candidates @('C:\Users\Jan\Desktop') -Folders $folders -Now $now | Should -BeNullOrEmpty
     }
 }
