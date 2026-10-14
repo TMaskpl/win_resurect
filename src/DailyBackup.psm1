@@ -105,3 +105,214 @@ function Test-DailyTargetParams {
     if ($errs.Count -gt 0) { throw ($errs -join '; ') }
     return $t
 }
+
+function Resolve-DailyTarget {
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Volumes,
+        [Parameter(Mandatory)][string]$ComputerName
+    )
+    $t = $Config.Target
+    if ($t.Type -eq 'smb') {
+        return [pscustomobject]@{
+            Ok = $true; Reason = ''; Drive = ''
+            ShareRoot  = Get-ShareRoot -Share $t.Share
+            Repository = '{0}\{1}\{2}' -f $t.Share, $t.Folder, $ComputerName
+        }
+    }
+    $found = @($Volumes | Where-Object { $_.Label -eq $t.Label })
+    if ($found.Count -eq 0) {
+        return [pscustomobject]@{ Ok = $false; Reason = "cel niedostępny: nie znaleziono dysku o etykiecie '$($t.Label)'"; Drive = ''; ShareRoot = ''; Repository = '' }
+    }
+    if ($found.Count -gt 1) {
+        return [pscustomobject]@{ Ok = $false; Reason = "więcej niż jeden dysk o etykiecie '$($t.Label)' - nadaj unikalną etykietę"; Drive = ''; ShareRoot = ''; Repository = '' }
+    }
+    $drive = $found[0].Drive.Substring(0, 1).ToUpper() + ':'
+    return [pscustomobject]@{ Ok = $true; Reason = ''; Drive = $drive; ShareRoot = ''; Repository = '{0}\{1}\{2}' -f $drive, $t.Folder, $ComputerName }
+}
+
+function Get-DailyBackupArgs {
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string[]]$Folders, [Parameter(Mandatory)][string]$ComputerName)
+    $a = @('backup', '--json', '--use-fs-snapshot', '--host', $ComputerName)
+    foreach ($e in @($Config.Excludes)) { $a += @('--exclude', $e) }
+    $a += @($Folders)
+    return $a
+}
+
+function Get-DailyForgetArgs {
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$ComputerName)
+    return @('forget', '--host', $ComputerName, '--keep-daily', [string]$Config.Retention.Daily,
+        '--keep-weekly', [string]$Config.Retention.Weekly, '--keep-monthly', [string]$Config.Retention.Monthly, '--prune')
+}
+
+function Get-DailyCheckArgs { return @('check', '--read-data-subset=5%') }
+
+function Get-DailyInitCheckArgs { return @('cat', 'config') }
+
+function ConvertTo-DailyStatus {
+    param([Parameter(Mandatory)][int]$ExitCode)
+    if ($ExitCode -eq 0) { return 'ok' }
+    if ($ExitCode -eq 3) { return 'warn' }
+    return 'fail'
+}
+
+function Get-WorseStatus {
+    param([string]$A, [string]$B)
+    $rank = @{ ok = 0; warn = 1; fail = 2 }
+    if ($rank[$B] -gt $rank[$A]) { return $B }
+    return $A
+}
+
+function ConvertFrom-ResticSummary {
+    param([string[]]$Lines)
+    $added = [long]0
+    $snap = ''
+    foreach ($line in $Lines) {
+        if (-not $line -or -not $line.TrimStart().StartsWith('{')) { continue }
+        try { $j = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        $mt = $j.PSObject.Properties['message_type']
+        if ($mt -and $mt.Value -eq 'summary') {
+            $added = [long](Get-ConfigValue $j 'data_added' 0)
+            $id = [string](Get-ConfigValue $j 'snapshot_id' '')
+            $snap = $id.Substring(0, [Math]::Min(8, $id.Length))
+        }
+    }
+    return @{ AddedBytes = $added; Snapshot = $snap }
+}
+
+function ConvertFrom-ResticSnapshots {
+    param([string]$Json)
+    if (-not $Json -or -not $Json.Trim()) { return @() }
+    try { $items = @($Json | ConvertFrom-Json -ErrorAction Stop) } catch { return @() }
+    $out = @()
+    foreach ($i in $items) {
+        $raw = [string](Get-ConfigValue $i 'time' '')
+        $trimmed = $raw -replace '(\.\d{7})\d+', '$1'
+        $time = [datetime]::MinValue
+        [void][datetime]::TryParse($trimmed, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$time)
+        $out += [pscustomobject]@{
+            Id = [string](Get-ConfigValue $i 'id' ''); ShortId = [string](Get-ConfigValue $i 'short_id' '')
+            Time = $time; Host = [string](Get-ConfigValue $i 'hostname' ''); Paths = @(Get-ConfigValue $i 'paths' @())
+        }
+    }
+    return $out
+}
+
+function Format-Note {
+    param([string]$Text, [int]$MaxLength = 200)
+    if (-not $Text) { return '' }
+    $t = $Text -replace '[\x00-\x1f\x7f-\x9f]', ' '
+    $t = $t -replace '\\\\[^\s"'']+', '<path>'
+    $t = $t -replace '[A-Za-z]:\\[^\s"'']*', '<path>'
+    $t = ($t -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $MaxLength) { $t = $t.Substring(0, $MaxLength) }
+    return $t
+}
+
+function Get-FailureNote {
+    param([string[]]$Lines)
+    $picked = @()
+    foreach ($line in $Lines) {
+        if (-not $line -or -not $line.Trim()) { continue }
+        if ($line.TrimStart().StartsWith('{')) {
+            try { $j = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            $mt = $j.PSObject.Properties['message_type']
+            if ($mt -and $mt.Value -eq 'error') {
+                $err = $j.PSObject.Properties['error']
+                $msg = if ($err -and $err.Value.PSObject.Properties['message']) { [string]$err.Value.message } else { 'error' }
+                $picked += $msg
+            }
+        }
+        else { $picked += $line.Trim() }
+    }
+    return Format-Note -Text (@($picked | Select-Object -Last 3) -join ' | ')
+}
+
+function Select-ExistingFolders {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Folders,
+        [scriptblock]$Exists = { param($p) Test-Path -LiteralPath $p }
+    )
+    $ok = @(); $missing = @()
+    foreach ($f in $Folders) { if (& $Exists $f) { $ok += $f } else { $missing += $f } }
+    return @{ Existing = $ok; Missing = $missing }
+}
+
+function New-LastRun {
+    param(
+        [Parameter(Mandatory)][ValidateSet('ok', 'warn', 'fail')][string]$Status,
+        [Parameter(Mandatory)][datetime]$Started,
+        [Parameter(Mandatory)][datetime]$Finished,
+        [long]$AddedBytes = 0,
+        [string]$Snapshot = '',
+        [int]$Snapshots = 0,
+        [string]$ResticVersion = '',
+        [string[]]$Skipped = @(),
+        [string]$Note = '',
+        $Previous = $null
+    )
+    $fmt = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+    $fin = $Finished.ToUniversalTime().ToString($fmt)
+    $lastSuccess = ''
+    if ($Status -eq 'ok' -or $Status -eq 'warn') { $lastSuccess = $fin }
+    elseif ($Previous -and $Previous.PSObject.Properties['last_success']) { $lastSuccess = [string]$Previous.last_success }
+    return [ordered]@{
+        status = $Status; started = $Started.ToUniversalTime().ToString($fmt); finished = $fin
+        duration_s = [int][Math]::Round(($Finished - $Started).TotalSeconds)
+        added_bytes = $AddedBytes; snapshot = $Snapshot; snapshots = $Snapshots; restic_version = $ResticVersion
+        skipped_folders = @($Skipped); note = (Format-Note -Text $Note); last_success = $lastSuccess
+    }
+}
+
+function Save-LastRun {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$LastRun)
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $LastRun | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Read-LastRun {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try { return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop) }
+    catch { return $null }
+}
+
+function Get-DailyStaleness {
+    param($LastRun, [Parameter(Mandatory)][datetime]$Now, [int]$MaxHours = 48)
+    if (-not $LastRun -or -not $LastRun.PSObject.Properties['last_success'] -or -not $LastRun.last_success) { return 'never' }
+    $t = [datetime]::MinValue
+    if (-not [datetime]::TryParse([string]$LastRun.last_success, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$t)) { return 'never' }
+    if (($Now.ToUniversalTime() - $t.ToUniversalTime()).TotalHours -gt $MaxHours) { return 'stale' }
+    return 'fresh'
+}
+
+function Get-DailyStatusText {
+    param($LastRun, [Parameter(Mandatory)][datetime]$Now)
+    if (-not $LastRun) { return 'Kopia codzienna: brak danych o przebiegach (jeszcze się nie wykonała).' }
+    $stale = Get-DailyStaleness -LastRun $LastRun -Now $Now
+    $lines = @(
+        "Ostatni przebieg: $($LastRun.status) ($($LastRun.finished))",
+        "Ostatni sukces:   $(if ($LastRun.last_success) { $LastRun.last_success } else { 'brak' })",
+        "Czas: $($LastRun.duration_s) s, dodano: $(Format-Size ([long]$LastRun.added_bytes)), migawek: $($LastRun.snapshots)"
+    )
+    if ($LastRun.note) { $lines += "Uwagi: $($LastRun.note)" }
+    $sk = @($LastRun.skipped_folders)
+    if ($sk.Count -gt 0) { $lines += "Pominięte foldery: $($sk -join ', ')" }
+    if ($stale -eq 'stale') { $lines += 'UWAGA: kopia NIEAKTUALNA (ostatni sukces starszy niż 48 godzin).' }
+    elseif ($stale -eq 'never') { $lines += 'UWAGA: kopia NIEAKTUALNA (brak udanego przebiegu).' }
+    return ($lines -join "`r`n")
+}
+
+function Write-DailyLog {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$Lines, [int]$MaxBytes = 1048576, [int]$Keep = 5)
+    if ((Test-Path -LiteralPath $Path) -and ((Get-Item -LiteralPath $Path).Length -ge $MaxBytes)) {
+        $last = "$Path.$($Keep - 1)"
+        if (Test-Path -LiteralPath $last) { Remove-Item -LiteralPath $last -Force }
+        for ($i = $Keep - 2; $i -ge 1; $i--) {
+            if (Test-Path -LiteralPath "$Path.$i") { Move-Item -LiteralPath "$Path.$i" -Destination "$Path.$($i + 1)" -Force }
+        }
+        Move-Item -LiteralPath $Path -Destination "$Path.1" -Force
+    }
+    Add-Content -LiteralPath $Path -Value $Lines -Encoding UTF8
+}
