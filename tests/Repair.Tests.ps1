@@ -275,6 +275,11 @@ Describe 'Get-DirectorySize' {
         Get-DirectorySize -Path $d | Should -Be 1500
         Get-DirectorySize -Path (Join-Path $TestDrive 'nie-ma') | Should -Be 0
     }
+    It 'returns 0 for a folder without files, also under StrictMode' {
+        $d = Join-Path $TestDrive 'empty-sz'
+        New-Item -ItemType Directory -Force -Path (Join-Path $d 'sub') | Out-Null
+        Get-DirectorySize -Path $d | Should -Be 0
+    }
 }
 
 Describe 'Test-ProtectedStartupItem' {
@@ -757,5 +762,210 @@ Describe 'system-repair module' {
     It 'is always offered' {
         $c = New-TestContext -Audit (New-TestAuditObject) -Ops (New-FakeOps).Ops -Runner { }
         (& (Get-SystemRepairModule).Test $c) | Should -BeTrue
+    }
+}
+
+Describe 'undo store' {
+    It 'appends records, reads them back and marks a module as undone' {
+        $d = Join-Path $TestDrive 'u1'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        @(Read-UndoRecords -Dir $d).Count | Should -Be 0
+        Add-UndoRecord -Dir $d -Record @{ module = 'startup'; kind = 'run'; name = 'A' }
+        Add-UndoRecord -Dir $d -Record @{ module = 'windows-update'; type = 'rename'; from = 'x'; to = 'y' }
+        $all = @(Read-UndoRecords -Dir $d)
+        $all.Count | Should -Be 2
+        $all[0].name | Should -Be 'A'
+        Set-UndoDone -Dir $d -Module 'startup'
+        $after = @(Read-UndoRecords -Dir $d)
+        $after[0].undone | Should -BeTrue
+        $after[1].PSObject.Properties['undone'] | Should -BeNullOrEmpty
+    }
+    It 'survives a damaged file' {
+        $d = Join-Path $TestDrive 'u2'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        Set-Content -LiteralPath (Get-UndoPath -Dir $d) -Value '{ not json'
+        @(Read-UndoRecords -Dir $d).Count | Should -Be 0
+    }
+    It 'finds the newest run folder that still has something to undo for a module' {
+        $w = Join-Path $TestDrive 'u3'
+        foreach ($n in '20261001-100000', '20261005-100000', '20261010-100000') { New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $w 'repair') $n) | Out-Null }
+        Add-UndoRecord -Dir (Join-Path (Join-Path $w 'repair') '20261005-100000') -Record @{ module = 'startup'; name = 'A' }
+        Add-UndoRecord -Dir (Join-Path (Join-Path $w 'repair') '20261010-100000') -Record @{ module = 'windows-update'; type = 'rename' }
+        (Split-Path -Leaf (Get-LatestUndoDir -WorkDir $w -Module 'startup')) | Should -Be '20261005-100000'
+        Set-UndoDone -Dir (Join-Path (Join-Path $w 'repair') '20261005-100000') -Module 'startup'
+        Get-LatestUndoDir -WorkDir $w -Module 'startup' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'ConvertFrom-NumberSelection' {
+    It 'parses numbers and ranges into a sorted unique list' {
+        $r = ConvertFrom-NumberSelection -Text '3, 1-2,2' -Max 5
+        $r.Valid | Should -BeTrue
+        ($r.Numbers -join ',') | Should -Be '1,2,3'
+    }
+    It 'treats an empty answer as a valid choice of nothing' {
+        $r = ConvertFrom-NumberSelection -Text '  ' -Max 5
+        $r.Valid | Should -BeTrue
+        @($r.Numbers).Count | Should -Be 0
+    }
+    It 'rejects every kind of garbage as a whole' {
+        foreach ($t in '0', '99', '6', 'abc', '1,,3', '3-1', '1-', '-2', '1;2', '1.5', '99999999999') {
+            (ConvertFrom-NumberSelection -Text $t -Max 5).Valid | Should -BeFalse -Because "'$t'"
+        }
+    }
+}
+
+Describe 'Get-ExpiredBackups' {
+    It 'returns only backup folders older than the limit and ignores other names' {
+        $names = @('SoftwareDistribution.bak-20260901', 'SoftwareDistribution.bak-20261010', 'catroot2.bak-20260920-101500', 'SoftwareDistribution', 'inne.bak-20200101', 'catroot2.bak-zle')
+        $e = @(Get-ExpiredBackups -Names $names -Now ([datetime]'2026-10-15'))
+        $e | Should -Contain 'SoftwareDistribution.bak-20260901'
+        $e | Should -Contain 'catroot2.bak-20260920-101500'
+        $e.Count | Should -Be 2
+    }
+}
+
+Describe 'windows-update module' {
+    BeforeEach {
+        $script:sr = Join-Path $TestDrive ('w' + [guid]::NewGuid().ToString('N'))
+        $script:sd = Join-Path $script:sr 'SoftwareDistribution'
+        $script:cr = Join-Path (Join-Path $script:sr 'System32') 'catroot2'
+        New-Item -ItemType Directory -Force -Path $script:sd, $script:cr | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:sd 'x.dat') -Value 'x'
+        $script:run = Join-Path $TestDrive ('r' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $script:run | Out-Null
+        $script:allRunning = @{ BITS = 'Running'; wuauserv = 'Running'; appidsvc = 'Running'; cryptsvc = 'Running' }
+    }
+
+    It 'stops the services, renames the two folders (not deletes), resets winsock and starts the services again' {
+        $ops = New-FakeOps -States $script:allRunning
+        $fr = New-FakeRunner
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops $ops.Ops -Runner $fr.Runner -SystemRoot $script:sr -RunDir $script:run
+        $r = & (Get-WindowsUpdateModule).Apply $c
+        $r.Status | Should -Be 'done'
+        (Test-Path -LiteralPath (Join-Path $script:sd 'x.dat')) | Should -BeFalse
+        (Test-Path -LiteralPath ($script:sd + '.bak-20261015')) | Should -BeTrue
+        (Test-Path -LiteralPath ($script:cr + '.bak-20261015')) | Should -BeTrue
+        ($fr.Calls -join "`n") | Should -Match 'netsh.exe winsock reset'
+        foreach ($n in 'BITS', 'wuauserv', 'appidsvc', 'cryptsvc') {
+            $ops.Log | Should -Contain "svc:stop:$n"
+            $ops.Log | Should -Contain "svc:start:$n"
+        }
+        $firstRename = $ops.Log | Where-Object { $_ -like 'rename:*' } | Select-Object -First 1
+        $ops.Log.IndexOf('svc:stop:wuauserv') | Should -BeLessThan $ops.Log.IndexOf($firstRename)
+        @(Read-UndoRecords -Dir $script:run).Count | Should -Be 2
+    }
+
+    It 'starts the services again even when the rename throws, and the module reports a failure' {
+        $ops = New-FakeOps -States $script:allRunning -FailRename
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops $ops.Ops -Runner (New-FakeRunner).Runner -SystemRoot $script:sr -RunDir $script:run
+        $r = Invoke-RepairModule -Module (Get-WindowsUpdateModule) -Context $c
+        $r.Status | Should -Be 'fail'
+        foreach ($n in 'BITS', 'wuauserv', 'appidsvc', 'cryptsvc') { $ops.Log | Should -Contain "svc:start:$n" }
+        (Test-Path -LiteralPath (Join-Path $script:sd 'x.dat')) | Should -BeTrue
+    }
+
+    It 'does not start services that were not running' {
+        $ops = New-FakeOps -States @{ BITS = 'Stopped'; wuauserv = 'Running'; appidsvc = 'Stopped'; cryptsvc = 'Running' }
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops $ops.Ops -Runner (New-FakeRunner).Runner -SystemRoot $script:sr -RunDir $script:run
+        & (Get-WindowsUpdateModule).Apply $c | Out-Null
+        $ops.Log | Should -Not -Contain 'svc:start:BITS'
+        $ops.Log | Should -Contain 'svc:start:wuauserv'
+    }
+
+    It 'removes backup folders older than 14 days but keeps recent ones' {
+        $old = $script:sd + '.bak-20260901'
+        $recent = $script:cr + '.bak-20261010'
+        New-Item -ItemType Directory -Force -Path $old, $recent | Out-Null
+        $ops = New-FakeOps -States $script:allRunning
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops $ops.Ops -Runner (New-FakeRunner).Runner -SystemRoot $script:sr -RunDir $script:run
+        & (Get-WindowsUpdateModule).Apply $c | Out-Null
+        (Test-Path -LiteralPath $old) | Should -BeFalse
+        (Test-Path -LiteralPath $recent) | Should -BeTrue
+    }
+
+    It 'undoes the rename when the new folder is still small, and leaves the backup when it already has data' {
+        $ops = New-FakeOps -States $script:allRunning
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops $ops.Ops -Runner (New-FakeRunner).Runner -SystemRoot $script:sr -RunDir $script:run
+        & (Get-WindowsUpdateModule).Apply $c | Out-Null
+        New-Item -ItemType Directory -Force -Path $script:sd | Out-Null          # Windows odtworzył pusty folder
+        New-Item -ItemType Directory -Force -Path $script:cr | Out-Null          # ten już ma dane
+        [System.IO.File]::WriteAllBytes((Join-Path $script:cr 'big.bin'), (New-Object byte[] (2MB)))
+        $msgs = & (Get-WindowsUpdateModule).Undo $c @(Read-UndoRecords -Dir $script:run)
+        (Test-Path -LiteralPath (Join-Path $script:sd 'x.dat')) | Should -BeTrue
+        (Test-Path -LiteralPath ($script:cr + '.bak-20261015')) | Should -BeTrue
+        ($msgs -join ' ') | Should -Match 'już ma dane'
+    }
+
+    It 'is always offered' {
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops (New-FakeOps).Ops -Runner { }
+        (& (Get-WindowsUpdateModule).Test $c) | Should -BeTrue
+    }
+}
+
+Describe 'startup module' {
+    BeforeAll {
+        $script:items = @(
+            @{ Name = 'Spotify'; Kind = 'run'; Command = 's.exe'; Publisher = 'Spotify AB'; Location = 'HKCU:\Run'; Disableable = $true; Reason = '' },
+            @{ Name = 'Defender'; Kind = 'service'; Command = 'd.exe'; Publisher = 'Microsoft'; Location = 'service'; Disableable = $false; Reason = 'chronione' },
+            @{ Name = 'Adobe'; Kind = 'task'; Command = 'a.exe'; Publisher = 'Adobe'; Location = '\'; Disableable = $true; Reason = '' })
+    }
+    BeforeEach {
+        $script:run = Join-Path $TestDrive ('s' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $script:run | Out-Null
+    }
+
+    It 'lists items sorted by name so numbers shown and numbers chosen agree' {
+        (Get-StartupList -Audit (New-TestAuditObject -Startup $script:items) | ForEach-Object { $_.Name }) -join ',' | Should -Be 'Adobe,Defender,Spotify'
+    }
+
+    It 'is offered only when something can be disabled' {
+        $none = @(@{ Name = 'D'; Kind = 'service'; Command = ''; Publisher = 'Microsoft'; Location = 's'; Disableable = $false; Reason = 'chronione' })
+        (& (Get-StartupModule).Test (New-TestContext -Audit (New-TestAuditObject -Startup $none) -Ops @{} -Runner { })) | Should -BeFalse
+        (& (Get-StartupModule).Test (New-TestContext -Audit (New-TestAuditObject -Startup $script:items) -Ops @{} -Runner { })) | Should -BeTrue
+    }
+
+    It 'disables exactly the chosen items, refuses protected ones and records undo data' {
+        $ops = New-FakeOps
+        $c = New-TestContext -Audit (New-TestAuditObject -Startup $script:items) -Ops $ops.Ops -Runner { } -Prompt { '1-3' } -RunDir $script:run
+        $r = & (Get-StartupModule).Apply $c
+        $r.Status | Should -Be 'done'
+        $ops.Log | Should -Contain 'disable:Adobe'
+        $ops.Log | Should -Contain 'disable:Spotify'
+        $ops.Log | Should -Not -Contain 'disable:Defender'
+        ($r.Messages -join ' ') | Should -Match 'Defender.*chronione'
+        $rec = @(Read-UndoRecords -Dir $script:run)
+        $rec.Count | Should -Be 2
+        $rec[0].module | Should -Be 'startup'
+    }
+
+    It 'changes nothing for garbage, out-of-range or empty answers' {
+        foreach ($answer in '0', '99', 'abc', '1,,3', '3-1', '') {
+            $ops = New-FakeOps
+            $a = $answer
+            $c = New-TestContext -Audit (New-TestAuditObject -Startup $script:items) -Ops $ops.Ops -Runner { } -Prompt ({ $a }.GetNewClosure()) -RunDir $script:run
+            $r = & (Get-StartupModule).Apply $c
+            $r.Status | Should -Be 'skipped' -Because "'$answer'"
+            $ops.Log.Count | Should -Be 0 -Because "'$answer'"
+        }
+    }
+
+    It 'reports a failing disable and keeps going' {
+        $ops = New-FakeOps
+        $ops.Ops['DisableStartup'] = { param($Item) if ($Item.Name -eq 'Adobe') { throw 'brak dostępu' }; @{ kind = $Item.Kind; name = $Item.Name; location = $Item.Location } }
+        $c = New-TestContext -Audit (New-TestAuditObject -Startup $script:items) -Ops $ops.Ops -Runner { } -Prompt { '1,3' } -RunDir $script:run
+        $r = & (Get-StartupModule).Apply $c
+        ($r.Messages -join ' ') | Should -Match 'Adobe.*brak dostępu'
+        @(Read-UndoRecords -Dir $script:run).Count | Should -Be 1
+    }
+
+    It 'undo re-enables every record' {
+        $ops = New-FakeOps
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops $ops.Ops -Runner { }
+        $recs = @([pscustomobject]@{ module = 'startup'; kind = 'run'; name = 'Spotify'; location = 'HKCU:\Run'; value = 's.exe' }, [pscustomobject]@{ module = 'startup'; kind = 'task'; name = 'Adobe'; location = '\' })
+        $msgs = & (Get-StartupModule).Undo $c $recs
+        $ops.Log | Should -Contain 'enable:Spotify'
+        $ops.Log | Should -Contain 'enable:Adobe'
+        @($msgs).Count | Should -BeGreaterThan 0
     }
 }

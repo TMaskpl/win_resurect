@@ -314,9 +314,9 @@ function Get-CleanupRoots {
 function Get-DirectorySize {
     param([string]$Path)
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return 0 }
-    $sum = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
-    if ($null -eq $sum) { return 0 }
-    return [long]$sum
+    $sum = 0L
+    foreach ($f in @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue)) { $sum += [long]$f.Length }
+    return $sum
 }
 
 function Test-ProtectedStartupItem {
@@ -742,6 +742,45 @@ function Get-DefaultOps {
         }
         ClearRecycleBin = { Clear-RecycleBin -Force -ErrorAction Stop }
         RenameItem      = { param($From, $To) Rename-Item -LiteralPath $From -NewName (Split-Path -Leaf $To) -ErrorAction Stop }
+        DisableStartup  = {
+            param($Item)
+            switch ($Item.Kind) {
+                'run' {
+                    $val = [string](Get-ItemProperty -LiteralPath $Item.Location -Name $Item.Name -ErrorAction Stop).($Item.Name)
+                    $bak = 'HKLM:\SOFTWARE\WinResurect\DisabledStartup'
+                    if (-not (Test-Path -LiteralPath $bak)) { New-Item -Path $bak -Force | Out-Null }
+                    $hive = if ($Item.Location -like 'HKCU*') { 'HKCU' } else { 'HKLM' }
+                    New-ItemProperty -LiteralPath $bak -Name ('{0}|{1}' -f $hive, $Item.Name) -Value $val -PropertyType String -Force | Out-Null
+                    Remove-ItemProperty -LiteralPath $Item.Location -Name $Item.Name -ErrorAction Stop
+                    return @{ kind = 'run'; name = $Item.Name; location = $Item.Location; value = $val }
+                }
+                'task' {
+                    Disable-ScheduledTask -TaskName $Item.Name -TaskPath $Item.Location -ErrorAction Stop | Out-Null
+                    return @{ kind = 'task'; name = $Item.Name; location = $Item.Location }
+                }
+                'service' {
+                    $prev = "$((Get-Service -Name $Item.Name -ErrorAction Stop).StartType)"
+                    Set-Service -Name $Item.Name -StartupType Manual -ErrorAction Stop
+                    return @{ kind = 'service'; name = $Item.Name; location = 'service'; previous = $prev }
+                }
+                default { throw ('Nieobsługiwany rodzaj wpisu: {0}' -f $Item.Kind) }
+            }
+        }
+        EnableStartup   = {
+            param($Rec)
+            switch ($Rec.kind) {
+                'run' {
+                    Set-ItemProperty -LiteralPath $Rec.location -Name $Rec.name -Value $Rec.value -ErrorAction Stop
+                    $hive = if ($Rec.location -like 'HKCU*') { 'HKCU' } else { 'HKLM' }
+                    Remove-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\WinResurect\DisabledStartup' -Name ('{0}|{1}' -f $hive, $Rec.name) -ErrorAction SilentlyContinue
+                }
+                'task' { Enable-ScheduledTask -TaskName $Rec.name -TaskPath $Rec.location -ErrorAction Stop | Out-Null }
+                'service' {
+                    $t = if ($Rec.previous -in 'Automatic', 'Manual', 'Disabled') { $Rec.previous } else { 'Automatic' }
+                    Set-Service -Name $Rec.name -StartupType $t -ErrorAction Stop
+                }
+            }
+        }
     }
 }
 
@@ -875,6 +914,216 @@ function Get-SystemRepairModule {
             $sfc = & $c.Runner 'sfc.exe' @('/scannow') 3600
             $check = & $c.Runner 'dism.exe' @('/Online', '/Cleanup-Image', '/CheckHealth') 600
             return (Get-SystemRepairVerdict -Restore $restore -Sfc $sfc -Check $check)
+        }
+    }
+}
+
+function Get-UndoPath { param([Parameter(Mandatory)][string]$Dir) return (Join-Path $Dir 'undo.json') }
+
+function Read-UndoRecords {
+    param([Parameter(Mandatory)][string]$Dir)
+    $p = Get-UndoPath -Dir $Dir
+    if (-not (Test-Path -LiteralPath $p)) { return @() }
+    try { $o = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop }
+    catch { return @() }
+    return @(Expand-JsonItems $o)
+}
+
+function Save-UndoRecords {
+    param([Parameter(Mandatory)][string]$Dir, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records)
+    if (-not (Test-Path -LiteralPath $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Out-Null }
+    ConvertTo-Json -InputObject @($Records) -Depth 6 | Set-Content -LiteralPath (Get-UndoPath -Dir $Dir) -Encoding UTF8
+}
+
+function Add-UndoRecord {
+    param([Parameter(Mandatory)][string]$Dir, [Parameter(Mandatory)][hashtable]$Record)
+    $all = @(Read-UndoRecords -Dir $Dir) + @([pscustomobject]$Record)
+    Save-UndoRecords -Dir $Dir -Records $all
+}
+
+function Test-UndoDone {
+    param($Record)
+    $p = $Record.PSObject.Properties['undone']
+    return [bool]($p -and $p.Value)
+}
+
+function Set-UndoDone {
+    param([Parameter(Mandatory)][string]$Dir, [Parameter(Mandatory)][string]$Module)
+    $all = @(Read-UndoRecords -Dir $Dir)
+    foreach ($r in $all) { if ($r.module -eq $Module) { $r | Add-Member -NotePropertyName undone -NotePropertyValue $true -Force } }
+    Save-UndoRecords -Dir $Dir -Records $all
+}
+
+function Get-LatestUndoDir {
+    param([Parameter(Mandatory)][string]$WorkDir, [Parameter(Mandatory)][string]$Module)
+    $base = Join-Path $WorkDir 'repair'
+    if (-not (Test-Path -LiteralPath $base)) { return $null }
+    foreach ($d in @(Get-ChildItem -LiteralPath $base -Directory | Sort-Object Name -Descending)) {
+        $recs = @(Read-UndoRecords -Dir $d.FullName | Where-Object { $_.module -eq $Module -and -not (Test-UndoDone $_) })
+        if ($recs.Count -gt 0) { return $d.FullName }
+    }
+    return $null
+}
+
+function ConvertFrom-NumberSelection {
+    param([AllowEmptyString()][string]$Text = '', [Parameter(Mandatory)][int]$Max)
+    $invalid = @{ Valid = $false; Numbers = @() }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @{ Valid = $true; Numbers = @() } }
+    $set = New-Object System.Collections.Generic.SortedSet[int]
+    try {
+        foreach ($part in $Text.Split(',')) {
+            $p = $part.Trim()
+            if ($p -match '^(\d+)$') { $a = [int]$Matches[1]; $b = $a }
+            elseif ($p -match '^(\d+)\s*-\s*(\d+)$') { $a = [int]$Matches[1]; $b = [int]$Matches[2] }
+            else { return $invalid }
+            if ($a -lt 1 -or $b -gt $Max -or $a -gt $b) { return $invalid }
+            for ($i = $a; $i -le $b; $i++) { [void]$set.Add($i) }
+        }
+    }
+    catch { return $invalid }
+    return @{ Valid = $true; Numbers = @($set) }
+}
+
+function Get-StartupList {
+    param([Parameter(Mandatory)]$Audit)
+    return @(@($Audit.startup) | Sort-Object { $_.Name })
+}
+
+function Get-ExpiredBackups {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Names, [Parameter(Mandatory)][datetime]$Now, [int]$Days = 14)
+    $out = @()
+    foreach ($n in $Names) {
+        if ($n -notmatch '^(SoftwareDistribution|catroot2)\.bak-(\d{8})(-\d{6})?$') { continue }
+        $d = [datetime]::MinValue
+        if ([datetime]::TryParseExact($Matches[2], 'yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) {
+            if (($Now - $d).TotalDays -gt $Days) { $out += $n }
+        }
+    }
+    return @($out)
+}
+
+function Get-WindowsUpdateModule {
+    return @{
+        Name  = 'windows-update'
+        Title = 'Reset komponentów Windows Update'
+        Test  = { param($c) $true }
+        Plan  = {
+            param($c)
+            @('Zatrzymanie usług: BITS, wuauserv, appidsvc, cryptsvc',
+                'Zmiana nazwy (nie usunięcie): SoftwareDistribution i catroot2 na *.bak-<data>',
+                'netsh winsock reset (działa po restarcie)',
+                'Uruchomienie usług, które działały. Aktualizacje nie są instalowane, restart nie jest wymuszany.')
+        }
+        Apply = {
+            param($c)
+            $svc = 'BITS', 'wuauserv', 'appidsvc', 'cryptsvc'
+            $was = @{}
+            $msgs = @()
+            $sr = $c.SystemRoot
+            $stamp = $c.Now.ToString('yyyyMMdd', [System.Globalization.CultureInfo]::InvariantCulture)
+            $dirs = @((Join-Path $sr 'SoftwareDistribution'), (Join-Path (Join-Path $sr 'System32') 'catroot2'))
+            try {
+                foreach ($n in $svc) { $was[$n] = (& $c.Ops.Service $n 'state') }
+                foreach ($n in $svc) { if ($was[$n] -eq 'Running') { & $c.Ops.Service $n 'stop' | Out-Null } }
+                foreach ($dir in $dirs) {
+                    $parent = Split-Path -Parent $dir
+                    $names = @(Get-ChildItem -LiteralPath $parent -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+                    foreach ($old in (Get-ExpiredBackups -Names $names -Now $c.Now)) {
+                        $full = Join-Path $parent $old
+                        if (Test-SafeDeleteTarget -Path $full -AllowedRoots @($sr)) {
+                            Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue
+                            $msgs += ('Usunięto starą kopię: {0}' -f $old)
+                        }
+                    }
+                }
+                foreach ($from in $dirs) {
+                    if (-not (Test-Path -LiteralPath $from)) { continue }
+                    $to = '{0}.bak-{1}' -f $from, $stamp
+                    if (Test-Path -LiteralPath $to) { $to = '{0}-{1}' -f $to, $c.Now.ToString('HHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+                    & $c.Ops.RenameItem $from $to
+                    Add-UndoRecord -Dir $c.RunDir -Record @{ module = 'windows-update'; type = 'rename'; from = $from; to = $to }
+                    $msgs += ('Zmieniono nazwę: {0} -> {1}' -f (Split-Path -Leaf $from), (Split-Path -Leaf $to))
+                }
+                $r = & $c.Runner 'netsh.exe' @('winsock', 'reset') 120
+                $msgs += $(if ($r.ExitCode -eq 0) { 'Winsock zresetowany (zadziała po restarcie).' } else { ('netsh winsock reset: kod {0}.' -f $r.ExitCode) })
+            }
+            finally {
+                foreach ($n in @($svc)[($svc.Count - 1)..0]) { if ($was[$n] -eq 'Running') { & $c.Ops.Service $n 'start' | Out-Null } }
+            }
+            $msgs += 'Sprawdź Windows Update; jeśli system prosi o restart, wykonaj go po wizycie.'
+            return @{ Status = 'done'; Messages = $msgs }
+        }
+        Undo  = {
+            param($c, $records)
+            $svc = 'BITS', 'wuauserv', 'appidsvc', 'cryptsvc'
+            $was = @{}
+            $msgs = @()
+            try {
+                foreach ($n in $svc) { $was[$n] = (& $c.Ops.Service $n 'state') }
+                foreach ($n in $svc) { if ($was[$n] -eq 'Running') { & $c.Ops.Service $n 'stop' | Out-Null } }
+                foreach ($r in @($records | Where-Object { $_.module -eq 'windows-update' -and $_.type -eq 'rename' })) {
+                    if (-not (Test-Path -LiteralPath $r.to)) { $msgs += ('Brak kopii {0}: pomijam.' -f (Split-Path -Leaf $r.to)); continue }
+                    if (Test-Path -LiteralPath $r.from) {
+                        if ((Get-DirectorySize -Path $r.from) -gt 1MB) { $msgs += ('Nowy folder {0} już ma dane: zostawiam kopię {1}.' -f (Split-Path -Leaf $r.from), (Split-Path -Leaf $r.to)); continue }
+                        Remove-Item -LiteralPath $r.from -Recurse -Force
+                    }
+                    & $c.Ops.RenameItem $r.to $r.from
+                    $msgs += ('Przywrócono {0}.' -f (Split-Path -Leaf $r.from))
+                }
+            }
+            finally {
+                foreach ($n in @($svc)[($svc.Count - 1)..0]) { if ($was[$n] -eq 'Running') { & $c.Ops.Service $n 'start' | Out-Null } }
+            }
+            return $msgs
+        }
+    }
+}
+
+function Get-StartupModule {
+    return @{
+        Name  = 'startup'
+        Title = 'Autostart (wolny start)'
+        Test  = { param($c) @($c.Audit.startup | Where-Object { $_.Disableable }).Count -gt 0 }
+        Plan  = {
+            param($c)
+            $i = 0
+            foreach ($it in (Get-StartupList -Audit $c.Audit)) {
+                $i++
+                $tag = if ($it.Disableable) { '' } else { ' [{0}]' -f $it.Reason }
+                ('{0}. {1} ({2}, {3}){4}' -f $i, $it.Name, $it.Kind, $(if ($it.Publisher) { $it.Publisher } else { 'nieznany wydawca' }), $tag)
+            }
+            'Wyłączenie jest odwracalne (-Undo startup). Pozycje chronione nie zostaną ruszone.'
+        }
+        Apply = {
+            param($c)
+            $items = @(Get-StartupList -Audit $c.Audit)
+            $sel = & $c.Prompt 'Podaj numery pozycji do wyłączenia (np. 1,3-5); Enter = żadna'
+            $p = ConvertFrom-NumberSelection -Text ([string]$sel) -Max $items.Count
+            if (-not $p.Valid) { return @{ Status = 'skipped'; Messages = @('Nieprawidłowy wybór: nic nie zmieniono.') } }
+            if (@($p.Numbers).Count -eq 0) { return @{ Status = 'skipped'; Messages = @('Nic nie wybrano.') } }
+            $msgs = @(); $done = 0
+            foreach ($n in $p.Numbers) {
+                $it = $items[$n - 1]
+                if (-not $it.Disableable) { $msgs += ('Pominięto {0}: {1}.' -f $it.Name, $it.Reason); continue }
+                try {
+                    $rec = & $c.Ops.DisableStartup $it
+                    $rec['module'] = 'startup'
+                    Add-UndoRecord -Dir $c.RunDir -Record $rec
+                    $done++
+                    $msgs += ('Wyłączono: {0}' -f $it.Name)
+                }
+                catch { $msgs += ('Nie udało się wyłączyć {0}: {1}' -f $it.Name, $_.Exception.Message) }
+            }
+            return @{ Status = $(if ($done -gt 0) { 'done' } else { 'skipped' }); Messages = $msgs }
+        }
+        Undo  = {
+            param($c, $records)
+            $msgs = @()
+            foreach ($r in @($records | Where-Object { $_.module -eq 'startup' })) {
+                try { & $c.Ops.EnableStartup $r; $msgs += ('Przywrócono: {0}' -f $r.name) }
+                catch { $msgs += ('Nie udało się przywrócić {0}: {1}' -f $r.name, $_.Exception.Message) }
+            }
+            return $msgs
         }
     }
 }
