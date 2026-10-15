@@ -67,6 +67,23 @@ Start.cmd -Action remove-daily
 
 Instalacja pobiera restic z oficjalnego wydania na GitHubie, w wersji i z sumą SHA256 zapisaną w `restic-version.json` (niezgodna suma przerywa instalację), tworzy `C:\ProgramData\WinResurect\`, pokazuje **raz** hasło repozytorium (zapisz je w KeePass; bez niego kopia jest nie do odczytania), otwiera `daily.json` do wpisania folderów i rejestruje zadania. Szczegóły: [`docs/KOPIA-CODZIENNA.md`](docs/KOPIA-CODZIENNA.md).
 
+## Naprawa i czyszczenie systemu
+
+> Wersja przedpremierowa: zaimplementowana i przetestowana jednostkowo, jeszcze nie na prawdziwym Windows.
+
+Dwie akcje dla technika, uruchamiane z Start.cmd jako administrator (szczegóły: [docs/NAPRAWA.md](docs/NAPRAWA.md), checklista wizyty: [docs/WIZYTA.md](docs/WIZYTA.md)):
+
+```bat
+Start.cmd -Action audit
+Start.cmd -Action repair -ImageDate 2026-10-15
+Start.cmd -Action repair -Modules cleanup,startup
+Start.cmd -Action repair -Undo startup
+```
+
+- `audit` tylko czyta: dysk (SMART), wolne miejsce, czas startu, autostart, integralność systemu, aktualizacje, pamięć i restarty awaryjne. Zapisuje raport w `C:\ProgramData\WinResurect\repair\<data>\`.
+- `repair` najpierw sprawdza, czy jest świeża kopia (codzienna do 48 h albo obraz podany przez `-ImageDate`, do 30 dni) i tworzy punkt przywracania. Potem uruchamia moduły `system-repair`, `windows-update`, `cleanup`, `startup`, każdy po pokazaniu planu i za twoją zgodą (`-Yes` nie istnieje). Na końcu pokazuje różnicę przed i po.
+- Zmiany w `startup` i `windows-update` można cofnąć (`-Undo`). Czyszczenie plików jest nieodwracalne, dlatego wymaga kopii.
+
 ## Co robi narzędzie (kopia całego systemu)
 
 1. Sprawdza uprawnienia, cel, miejsce, BitLocker i zasilanie. Przy błędzie niczego nie zapisuje.

@@ -1122,3 +1122,25 @@ Describe 'repair entry script' {
         Invoke-Entry @((Join-Path $script:rootDir 'Invoke-Resurect.ps1'), '-Action', 'repair', '-Modules', 'bogus') | Should -Be 2
     }
 }
+
+Describe 'documentation' {
+    BeforeAll { $script:rootDir = Split-Path $PSScriptRoot -Parent }
+    It 'describes the audit and repair actions in the README with the honest status line' {
+        $r = Get-Content -LiteralPath (Join-Path $script:rootDir 'README.md') -Raw -Encoding UTF8
+        $r | Should -Match 'Naprawa i czyszczenie'
+        $r | Should -Match 'Start\.cmd -Action audit'
+        $r | Should -Match 'Start\.cmd -Action repair'
+        $r | Should -Match 'jeszcze nie na prawdziwym Windows'
+    }
+    It 'ships the repair and visit guides and links them from the README' {
+        foreach ($f in 'docs/NAPRAWA.md', 'docs/WIZYTA.md') { (Test-Path -LiteralPath (Join-Path $script:rootDir $f)) | Should -BeTrue -Because $f }
+        $r = Get-Content -LiteralPath (Join-Path $script:rootDir 'README.md') -Raw -Encoding UTF8
+        $r | Should -Match 'docs/NAPRAWA\.md'
+        $r | Should -Match 'docs/WIZYTA\.md'
+    }
+    It 'documents every module and the refusal of -Yes' {
+        $d = Get-Content -LiteralPath (Join-Path $script:rootDir 'docs/NAPRAWA.md') -Raw -Encoding UTF8
+        foreach ($m in 'system-repair', 'windows-update', 'cleanup', 'startup', '-ImageDate', '-SkipBackupCheck', '-Undo') { $d | Should -Match ([regex]::Escape($m)) -Because $m }
+        $d | Should -Match '-Yes'
+    }
+}
