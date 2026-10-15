@@ -2,6 +2,54 @@ BeforeAll {
     $script:root = Split-Path $PSScriptRoot -Parent
     $src = Join-Path $script:root 'src'
     foreach ($m in 'WinResurect.psm1', 'DailyBackup.psm1', 'Repair.psm1') { Import-Module (Join-Path $src $m) -Force }
+
+    function New-FakeRunner {
+        param([object[]]$Responses = @())
+        $log = New-Object System.Collections.ArrayList
+        $resp = $Responses
+        $runner = {
+            param($Exe, $ArgList, $TimeoutSec = 0)
+            $line = ('{0} {1}' -f $Exe, (@($ArgList) -join ' '))
+            [void]$log.Add($line)
+            foreach ($r in $resp) { if ($line -match $r.Match) { return @{ ExitCode = $r.ExitCode; Output = @($r.Output); TimedOut = [bool]$r.TimedOut } } }
+            return @{ ExitCode = 0; Output = @(); TimedOut = $false }
+        }.GetNewClosure()
+        return @{ Runner = $runner; Calls = $log }
+    }
+
+    function New-FakeOps {
+        param([hashtable]$States = @{}, [switch]$FailRename)
+        $log = New-Object System.Collections.ArrayList
+        $st = $States
+        $fail = $FailRename.IsPresent
+        $ops = @{
+            Service         = {
+                param($Name, $Action)
+                if ($Action -eq 'state') { if ($st.ContainsKey($Name)) { return $st[$Name] } return $null }
+                [void]$log.Add(('svc:{0}:{1}' -f $Action, $Name))
+            }.GetNewClosure()
+            ClearRecycleBin = { [void]$log.Add('recycle') }.GetNewClosure()
+            RenameItem      = {
+                param($From, $To)
+                if ($fail) { throw 'rename failed' }
+                [void]$log.Add(('rename:{0}->{1}' -f (Split-Path -Leaf $From), (Split-Path -Leaf $To)))
+                Move-Item -LiteralPath $From -Destination $To
+            }.GetNewClosure()
+            DisableStartup  = { param($Item) [void]$log.Add('disable:' + $Item.Name); @{ kind = $Item.Kind; name = $Item.Name; location = $Item.Location } }.GetNewClosure()
+            EnableStartup   = { param($Rec) [void]$log.Add('enable:' + $Rec.name) }.GetNewClosure()
+        }
+        return @{ Ops = $ops; Log = $log }
+    }
+
+    function New-TestAuditObject {
+        param($Candidates = @(), $ComponentStore = $null, $Startup = @())
+        [pscustomobject]@{ version = 1; computer = 'PC1'; generated = '2026-10-15T10:00:00'; findings = @(); candidates = @($Candidates); startup = @($Startup); componentStore = $ComponentStore; notes = @(); metrics = [ordered]@{ FreeBytes = $null; BootAvgSec = $null; StartupCount = $null; IntegrityStatus = $null } }
+    }
+
+    function New-TestContext {
+        param($Audit, [hashtable]$Ops, [scriptblock]$Runner, [scriptblock]$Ask = { $true }, [scriptblock]$Prompt = { '' }, [hashtable]$Roots = @{}, [string]$SystemRoot = '', [string]$RunDir = '')
+        New-RepairContext -Audit $Audit -Ops $Ops -Runner $Runner -Ask $Ask -Prompt $Prompt -Roots $Roots -SystemRoot $SystemRoot -RunDir $RunDir -Now ([datetime]'2026-10-15T10:00:00')
+    }
 }
 
 Describe 'status thresholds' {
@@ -502,5 +550,212 @@ Describe 'Invoke-RepairGate' {
         $g = Invoke-RepairGate -Facts $script:okFacts -LastRun $null -Now $script:now -SkipReason 'kopia w chmurze' -Creator { @() } -Ask { $true }
         $g.Allowed | Should -BeTrue
         ($g.Messages -join ' ') | Should -Match 'kopia w chmurze'
+    }
+}
+
+Describe 'Invoke-RepairModule' {
+    BeforeAll {
+        function New-ProbeModule {
+            param([bool]$Needed = $true, [string]$ApplyStatus = 'done', [switch]$Throw)
+            $applied = New-Object System.Collections.ArrayList
+            $m = @{
+                Name = 'probe'; Title = 'Próbny'
+                Test = { param($c) $Needed }.GetNewClosure()
+                Plan = { param($c) @('krok 1', 'krok 2') }
+                Apply = { param($c) [void]$applied.Add(1); if ($Throw) { throw 'kaboom' }; @{ Status = $ApplyStatus; Messages = @('zrobione') } }.GetNewClosure()
+            }
+            return @{ Module = $m; Applied = $applied }
+        }
+        $script:ctx = New-TestContext -Audit (New-TestAuditObject) -Ops @{} -Runner { }
+    }
+    It 'skips a module that has nothing to do without asking' {
+        $p = New-ProbeModule -Needed $false
+        $r = Invoke-RepairModule -Module $p.Module -Context $script:ctx
+        $r.Status | Should -Be 'skipped'
+        $p.Applied.Count | Should -Be 0
+    }
+    It 'shows the plan, asks, and does not apply when declined' {
+        $p = New-ProbeModule
+        $asked = New-Object System.Collections.ArrayList
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops @{} -Runner { } -Ask ({ param($q) [void]$asked.Add($q); $false }.GetNewClosure())
+        $r = Invoke-RepairModule -Module $p.Module -Context $c
+        $r.Status | Should -Be 'declined'
+        $p.Applied.Count | Should -Be 0
+        $asked[0] | Should -Match 'krok 1'
+        $asked[0] | Should -Match 'Próbny'
+    }
+    It 'applies after consent and returns the status of Apply' {
+        $p = New-ProbeModule
+        $r = Invoke-RepairModule -Module $p.Module -Context $script:ctx
+        $r.Status | Should -Be 'done'
+        $r.Messages | Should -Contain 'zrobione'
+    }
+    It 'turns an exception into a failure with a message instead of throwing' {
+        $p = New-ProbeModule -Throw
+        $r = Invoke-RepairModule -Module $p.Module -Context $script:ctx
+        $r.Status | Should -Be 'fail'
+        ($r.Messages -join ' ') | Should -Match 'kaboom'
+    }
+}
+
+Describe 'New-RepairContext' {
+    It 'defaults the system root to C:\Windows when the given one is empty or relative' {
+        (New-RepairContext -Audit $null -RunDir '' -SystemRoot '').SystemRoot | Should -Be 'C:\Windows'
+        (New-RepairContext -Audit $null -RunDir '' -SystemRoot 'Windows').SystemRoot | Should -Be 'C:\Windows'
+        (New-RepairContext -Audit $null -RunDir '' -SystemRoot 'D:\Win\').SystemRoot | Should -Be 'D:\Win'
+    }
+    It 'builds the cleanup roots from the system root unless roots are injected' {
+        (New-RepairContext -Audit $null -RunDir '' -SystemRoot 'D:\Win').Roots['temp-win'] | Should -Contain 'D:\Win\Temp'
+    }
+}
+
+Describe 'cleanup module' {
+    BeforeEach {
+        $base = Join-Path $TestDrive ('c' + [guid]::NewGuid().ToString('N'))
+        $script:wu = Join-Path $base 'wu'
+        $script:tw = Join-Path $base 'tw'
+        New-Item -ItemType Directory -Force -Path $script:wu, $script:tw | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $script:wu 'a.cab'), (New-Object byte[] 2000))
+        [System.IO.File]::WriteAllBytes((Join-Path $script:tw 'old.tmp'), (New-Object byte[] 100))
+        [System.IO.File]::WriteAllBytes((Join-Path $script:tw 'new.tmp'), (New-Object byte[] 100))
+        (Get-Item (Join-Path $script:tw 'old.tmp')).LastWriteTime = [datetime]'2026-09-01'
+        (Get-Item (Join-Path $script:tw 'new.tmp')).LastWriteTime = [datetime]'2026-10-14'
+        $script:roots = @{ 'temp-user' = @(); 'temp-win' = @($script:tw); 'wu-download' = @($script:wu); 'dumps' = @() }
+        $script:cands = @(
+            [pscustomobject]@{ id = 'wu-download'; label = 'Pobrane aktualizacje'; bytes = 2000 },
+            [pscustomobject]@{ id = 'temp-win'; label = 'Temp systemu'; bytes = 200 },
+            [pscustomobject]@{ id = 'recycle'; label = 'Kosz'; bytes = 500 },
+            [pscustomobject]@{ id = 'hibernate'; label = 'Hibernacja'; bytes = 900 })
+    }
+
+    It 'has nothing to do without candidates or a component store recommendation' {
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops @{} -Runner { }
+        (& (Get-CleanupModule).Test $c) | Should -BeFalse
+        $c2 = New-TestContext -Audit (New-TestAuditObject -ComponentStore $true) -Ops @{} -Runner { }
+        (& (Get-CleanupModule).Test $c2) | Should -BeTrue
+    }
+
+    It 'empties the update cache, removes only temp files older than 7 days, and reports freed space' {
+        $ops = New-FakeOps -States @{ wuauserv = 'Running' }
+        $fr = New-FakeRunner
+        $c = New-TestContext -Audit (New-TestAuditObject -Candidates $script:cands) -Ops $ops.Ops -Runner $fr.Runner -Roots $script:roots -Ask { $false }
+        $r = & (Get-CleanupModule).Apply $c
+        $r.Status | Should -Be 'done'
+        @(Get-ChildItem -LiteralPath $script:wu -Force).Count | Should -Be 0
+        (Test-Path -LiteralPath (Join-Path $script:tw 'old.tmp')) | Should -BeFalse
+        (Test-Path -LiteralPath (Join-Path $script:tw 'new.tmp')) | Should -BeTrue
+        ($r.Messages -join ' ') | Should -Match 'Zwolniono'
+    }
+
+    It 'stops the update service for the cache and starts it again afterwards' {
+        $ops = New-FakeOps -States @{ wuauserv = 'Running' }
+        $c = New-TestContext -Audit (New-TestAuditObject -Candidates $script:cands) -Ops $ops.Ops -Runner (New-FakeRunner).Runner -Roots $script:roots -Ask { $false }
+        & (Get-CleanupModule).Apply $c | Out-Null
+        $ops.Log.IndexOf('svc:stop:wuauserv') | Should -BeGreaterOrEqual 0
+        $ops.Log.IndexOf('svc:start:wuauserv') | Should -BeGreaterThan $ops.Log.IndexOf('svc:stop:wuauserv')
+    }
+
+    It 'does not start a service that was not running' {
+        $ops = New-FakeOps -States @{ wuauserv = 'Stopped' }
+        $c = New-TestContext -Audit (New-TestAuditObject -Candidates $script:cands) -Ops $ops.Ops -Runner (New-FakeRunner).Runner -Roots $script:roots -Ask { $false }
+        & (Get-CleanupModule).Apply $c | Out-Null
+        $ops.Log | Should -Not -Contain 'svc:start:wuauserv'
+    }
+
+    It 'asks separately about the recycle bin and hibernation and obeys a no' {
+        $ops = New-FakeOps
+        $fr = New-FakeRunner
+        $c = New-TestContext -Audit (New-TestAuditObject -Candidates $script:cands) -Ops $ops.Ops -Runner $fr.Runner -Roots $script:roots -Ask { $false }
+        & (Get-CleanupModule).Apply $c | Out-Null
+        $ops.Log | Should -Not -Contain 'recycle'
+        ($fr.Calls -join "`n") | Should -Not -Match 'powercfg'
+    }
+
+    It 'empties the recycle bin and turns hibernation off after a yes' {
+        $ops = New-FakeOps
+        $fr = New-FakeRunner
+        $c = New-TestContext -Audit (New-TestAuditObject -Candidates $script:cands) -Ops $ops.Ops -Runner $fr.Runner -Roots $script:roots -Ask { $true }
+        & (Get-CleanupModule).Apply $c | Out-Null
+        $ops.Log | Should -Contain 'recycle'
+        ($fr.Calls -join "`n") | Should -Match 'powercfg.exe -h off'
+    }
+
+    It 'cleans the component store without ResetBase when recommended' {
+        $fr = New-FakeRunner
+        $c = New-TestContext -Audit (New-TestAuditObject -ComponentStore $true) -Ops (New-FakeOps).Ops -Runner $fr.Runner -Roots $script:roots -Ask { $false }
+        & (Get-CleanupModule).Apply $c | Out-Null
+        ($fr.Calls -join "`n") | Should -Match '/StartComponentCleanup'
+        ($fr.Calls -join "`n") | Should -Not -Match 'ResetBase'
+    }
+
+    It 'fails closed on an unsafe root: nothing is deleted, the service is started again' {
+        $ops = New-FakeOps -States @{ wuauserv = 'Running' }
+        $bad = @{ 'temp-user' = @(); 'temp-win' = @(); 'wu-download' = @('C:\'); 'dumps' = @() }
+        $c = New-TestContext -Audit (New-TestAuditObject -Candidates $script:cands) -Ops $ops.Ops -Runner (New-FakeRunner).Runner -Roots $bad -Ask { $true }
+        $r = Invoke-RepairModule -Module (Get-CleanupModule) -Context $c
+        $r.Status | Should -Be 'fail'
+        (Test-Path -LiteralPath (Join-Path $script:wu 'a.cab')) | Should -BeTrue
+        $ops.Log | Should -Contain 'svc:start:wuauserv'
+    }
+}
+
+Describe 'system-repair parsing' {
+    It 'reads sfc output in English and Polish, including UTF-16 style NUL padding' {
+        ConvertFrom-SfcOutput -Text 'Windows Resource Protection did not find any integrity violations.' | Should -Be 'clean'
+        ConvertFrom-SfcOutput -Text 'Ochrona zasobów systemu Windows nie wykryła żadnych naruszeń integralności.' | Should -Be 'clean'
+        ConvertFrom-SfcOutput -Text 'Windows Resource Protection found corrupt files and successfully repaired them.' | Should -Be 'repaired'
+        ConvertFrom-SfcOutput -Text 'Ochrona zasobów systemu Windows znalazła uszkodzone pliki i pomyślnie je naprawiła.' | Should -Be 'repaired'
+        ConvertFrom-SfcOutput -Text 'Windows Resource Protection found corrupt files but was unable to fix some of them.' | Should -Be 'unrepairable'
+        ConvertFrom-SfcOutput -Text 'Ochrona zasobów systemu Windows znalazła uszkodzone pliki, ale nie może naprawić niektórych z nich.' | Should -Be 'unrepairable'
+        ConvertFrom-SfcOutput -Text "D`0i`0d`0 `0n`0o`0t`0 `0f`0i`0n`0d`0 `0a`0n`0y`0 `0i`0n`0t`0e`0g`0r`0i`0t`0y`0 `0v`0i`0o`0l`0a`0t`0i`0o`0n`0s`0" | Should -Be 'clean'
+        ConvertFrom-SfcOutput -Text 'Der Windows-Ressourcenschutz hat keine Integritätsverletzungen gefunden.' | Should -Be 'unknown'
+        ConvertFrom-SfcOutput -Text '' | Should -Be 'unknown'
+    }
+}
+
+Describe 'Get-SystemRepairVerdict' {
+    BeforeAll {
+        function New-Step($exit, $text, $timedOut = $false) { @{ ExitCode = $exit; Output = @($text); TimedOut = $timedOut } }
+        $script:okRestore = New-Step 0 'The restore operation completed successfully.'
+        $script:okSfc = New-Step 0 'Windows Resource Protection did not find any integrity violations.'
+        $script:okCheck = New-Step 0 'No component store corruption detected.'
+    }
+    It 'is done when everything is clean' {
+        (Get-SystemRepairVerdict -Restore $script:okRestore -Sfc $script:okSfc -Check $script:okCheck).Status | Should -Be 'done'
+    }
+    It 'fails and advises an ISO source when DISM RestoreHealth fails' {
+        $v = Get-SystemRepairVerdict -Restore (New-Step 1 'Error: 0x800f081f') -Sfc $script:okSfc -Check $script:okCheck
+        $v.Status | Should -Be 'fail'
+        ($v.Messages -join ' ') | Should -Match 'Source'
+    }
+    It 'fails when sfc cannot repair some files, and when the component store is still damaged' {
+        (Get-SystemRepairVerdict -Restore $script:okRestore -Sfc (New-Step 0 'found corrupt files but was unable to fix some of them') -Check $script:okCheck).Status | Should -Be 'fail'
+        (Get-SystemRepairVerdict -Restore $script:okRestore -Sfc $script:okSfc -Check (New-Step 0 'The component store is repairable.')).Status | Should -Be 'fail'
+    }
+    It 'fails on a timeout and names the step' {
+        $v = Get-SystemRepairVerdict -Restore (New-Step -1 '' $true) -Sfc $script:okSfc -Check $script:okCheck
+        $v.Status | Should -Be 'fail'
+        ($v.Messages -join ' ') | Should -Match 'RestoreHealth.*limit czasu'
+    }
+    It 'does not claim success for an unrecognised language: done, but says it could not read the result' {
+        $v = Get-SystemRepairVerdict -Restore $script:okRestore -Sfc (New-Step 0 'Der Windows-Ressourcenschutz hat nichts gefunden.') -Check (New-Step 0 'Keine Beschädigung.')
+        $v.Status | Should -Be 'done'
+        ($v.Messages -join ' ') | Should -Match 'nie rozpoznano'
+    }
+}
+
+Describe 'system-repair module' {
+    It 'runs DISM RestoreHealth, sfc and DISM CheckHealth in that order with the 60 min limit' {
+        $fr = New-FakeRunner
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops (New-FakeOps).Ops -Runner $fr.Runner
+        (& (Get-SystemRepairModule).Apply $c) | Out-Null
+        $fr.Calls.Count | Should -Be 3
+        $fr.Calls[0] | Should -Match 'dism.exe /Online /Cleanup-Image /RestoreHealth'
+        $fr.Calls[1] | Should -Match 'sfc.exe /scannow'
+        $fr.Calls[2] | Should -Match 'dism.exe /Online /Cleanup-Image /CheckHealth'
+    }
+    It 'is always offered' {
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops (New-FakeOps).Ops -Runner { }
+        (& (Get-SystemRepairModule).Test $c) | Should -BeTrue
     }
 }

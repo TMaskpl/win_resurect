@@ -728,3 +728,153 @@ function Invoke-RepairGate {
     if (& $Ask $q) { $msgs += 'Kontynuacja bez punktu przywracania (decyzja technika).'; return @{ Allowed = $true; Messages = @($msgs); RestorePoint = $false; Basis = $bk.Basis } }
     return @{ Allowed = $false; Messages = @($msgs + 'Przerwano: brak punktu przywracania.'); RestorePoint = $false; Basis = $bk.Basis }
 }
+
+function Get-DefaultOps {
+    return @{
+        Service         = {
+            param($Name, $Action)
+            $s = Get-Service -Name $Name -ErrorAction SilentlyContinue
+            switch ($Action) {
+                'state' { if ($s) { return "$($s.Status)" } return $null }
+                'stop' { if ($s) { Stop-Service -Name $Name -Force -ErrorAction Stop; $s.WaitForStatus('Stopped', [timespan]::FromSeconds(30)) } }
+                'start' { if ($s) { Start-Service -Name $Name -ErrorAction Stop } }
+            }
+        }
+        ClearRecycleBin = { Clear-RecycleBin -Force -ErrorAction Stop }
+        RenameItem      = { param($From, $To) Rename-Item -LiteralPath $From -NewName (Split-Path -Leaf $To) -ErrorAction Stop }
+    }
+}
+
+function New-RepairContext {
+    param(
+        $Audit, [string]$RunDir = '', [hashtable]$Ops = (Get-DefaultOps), [scriptblock]$Runner = (New-NativeRunner),
+        [scriptblock]$Ask = { param($q) (Read-Host $q) -match '^[TtYy]' }, [scriptblock]$Prompt = { param($q) Read-Host $q },
+        [datetime]$Now = (Get-Date), [string]$SystemRoot = '', [hashtable]$Roots = $null
+    )
+    $sr = 'C:\Windows'
+    if ($SystemRoot -and $SystemRoot -match '^([A-Za-z]:\\|/)') { $sr = $SystemRoot.TrimEnd('\', '/') }
+    elseif (-not $SystemRoot -and $env:SystemRoot -and $env:SystemRoot -match '^[A-Za-z]:\\') { $sr = $env:SystemRoot.TrimEnd('\') }
+    if (-not $Roots -or $Roots.Count -eq 0) { $Roots = Get-CleanupRoots -SystemRoot $sr }
+    return @{ Audit = $Audit; RunDir = $RunDir; Ops = $Ops; Runner = $Runner; Ask = $Ask; Prompt = $Prompt; Now = $Now; SystemRoot = $sr; Roots = $Roots }
+}
+
+function Invoke-RepairModule {
+    param([Parameter(Mandatory)][hashtable]$Module, [Parameter(Mandatory)][hashtable]$Context)
+    $name = $Module.Name
+    try {
+        if (-not (& $Module.Test $Context)) { return @{ Name = $name; Status = 'skipped'; Messages = @('Nic do zrobienia.') } }
+        $plan = @(& $Module.Plan $Context)
+        $text = ('Moduł: {0}' -f $Module.Title) + "`n  - " + ($plan -join "`n  - ") + "`nWykonać? (t/n)"
+        if (-not (& $Context.Ask $text)) { return @{ Name = $name; Status = 'declined'; Messages = @('Pominięte na życzenie technika.') } }
+        $r = & $Module.Apply $Context
+        return @{ Name = $name; Status = $r.Status; Messages = @($r.Messages) }
+    }
+    catch { return @{ Name = $name; Status = 'fail'; Messages = @(('Błąd: {0}' -f $_.Exception.Message)) } }
+}
+
+function Get-CleanupModule {
+    return @{
+        Name  = 'cleanup'
+        Title = 'Czyszczenie dysku'
+        Test  = {
+            param($c)
+            (@($c.Audit.candidates | Where-Object { $_.bytes -gt 0 }).Count -gt 0) -or ($c.Audit.componentStore -eq $true)
+        }
+        Plan  = {
+            param($c)
+            $lines = @()
+            foreach ($x in @($c.Audit.candidates)) { $lines += ('{0}: {1}' -f $x.label, (Format-Size ([long]$x.bytes))) }
+            if ($c.Audit.componentStore -eq $true) { $lines += 'Magazyn składników WinSxS: StartComponentCleanup (bez ResetBase)' }
+            $lines += 'Pliki tymczasowe: tylko starsze niż 7 dni, zablokowane zostaną pominięte. Kosz i hibernacja: osobne pytanie.'
+            return $lines
+        }
+        Apply = {
+            param($c)
+            $ids = @($c.Audit.candidates | ForEach-Object { $_.id })
+            $msgs = @(); $freed = 0L; $failed = 0; $skipped = 0
+            $wuWasRunning = $false
+            try {
+                if ($ids -contains 'wu-download') {
+                    $wuWasRunning = ((& $c.Ops.Service 'wuauserv' 'state') -eq 'Running')
+                    if ($wuWasRunning) { & $c.Ops.Service 'wuauserv' 'stop' | Out-Null }
+                }
+                foreach ($id in 'temp-user', 'temp-win', 'wu-download', 'dumps') {
+                    if ($ids -notcontains $id) { continue }
+                    $age = if ($id -in 'temp-user', 'temp-win') { 7 } else { 0 }
+                    $paths = @($c.Roots[$id] | Where-Object { $_ })
+                    foreach ($p in $paths) {
+                        $r = Remove-FolderContents -Path $p -AllowedRoots $paths -OlderThanDays $age -Now $c.Now
+                        $freed += $r.FreedBytes; $failed += $r.Failed; $skipped += $r.Skipped
+                    }
+                }
+            }
+            finally {
+                if ($wuWasRunning) { & $c.Ops.Service 'wuauserv' 'start' | Out-Null }
+            }
+            if ($ids -contains 'recycle' -and (& $c.Ask 'Opróżnić kosz? Tego nie da się cofnąć. (t/n)')) {
+                & $c.Ops.ClearRecycleBin
+                $msgs += 'Kosz opróżniony.'
+            }
+            if ($ids -contains 'hibernate' -and (& $c.Ask 'Wyłączyć hibernację (usuwa hiberfil.sys i wyłącza szybki start)? (t/n)')) {
+                $r = & $c.Runner 'powercfg.exe' @('-h', 'off') 60
+                $msgs += $(if ($r.ExitCode -eq 0) { 'Hibernacja wyłączona.' } else { ('powercfg -h off zakończyło się kodem {0}.' -f $r.ExitCode) })
+            }
+            if ($c.Audit.componentStore -eq $true) {
+                $r = & $c.Runner 'dism.exe' @('/Online', '/Cleanup-Image', '/StartComponentCleanup') 3600
+                $msgs += $(if ($r.ExitCode -eq 0) { 'Magazyn składników wyczyszczony.' } else { ('DISM StartComponentCleanup: kod {0}.' -f $r.ExitCode) })
+            }
+            $msgs = @(('Zwolniono ok. {0} (pominięto: {1}, nieudane: {2}).' -f (Format-Size $freed), $skipped, $failed)) + $msgs
+            return @{ Status = 'done'; Messages = $msgs }
+        }
+    }
+}
+
+function ConvertFrom-SfcOutput {
+    param([AllowEmptyString()][string]$Text = '')
+    $t = $Text -replace "`0", ''
+    if ($t -match '(?i)unable to fix|nie mo[żz]e naprawi|nie uda[łl]o si[ęe] naprawi') { return 'unrepairable' }
+    if ($t -match '(?i)successfully repaired|pomy[śs]lnie (je )?napraw') { return 'repaired' }
+    if ($t -match '(?i)did not find any integrity violations|nie wykry[łl]a [żz]adnych naruszeń|nie wykry[łl]a naruszeń') { return 'clean' }
+    return 'unknown'
+}
+
+function Get-SystemRepairVerdict {
+    param([Parameter(Mandatory)]$Restore, [Parameter(Mandatory)]$Sfc, [Parameter(Mandatory)]$Check)
+    $msgs = @(); $status = 'done'
+    $steps = @(@{ T = 'DISM /RestoreHealth'; R = $Restore }, @{ T = 'sfc /scannow'; R = $Sfc }, @{ T = 'DISM /CheckHealth'; R = $Check })
+    foreach ($s in $steps) { if ($s.R.TimedOut) { $status = 'fail'; $msgs += ('{0}: przekroczono limit czasu.' -f $s.T) } }
+    if ($status -eq 'fail') { return @{ Status = $status; Messages = $msgs } }
+    if ($Restore.ExitCode -ne 0) {
+        $status = 'fail'
+        $msgs += ('DISM /RestoreHealth nie powiódł się (kod {0}). Spróbuj z nośnika: DISM /Online /Cleanup-Image /RestoreHealth /Source:<ISO>\sources\install.wim /LimitAccess (parametr Source).' -f $Restore.ExitCode)
+    }
+    else { $msgs += 'DISM /RestoreHealth: zakończony.' }
+    switch (ConvertFrom-SfcOutput -Text ($Sfc.Output -join "`n")) {
+        'clean' { $msgs += 'sfc: nie wykryto naruszeń integralności.' }
+        'repaired' { $msgs += 'sfc: uszkodzone pliki zostały naprawione.' }
+        'unrepairable' { $status = 'fail'; $msgs += 'sfc: nie wszystkie pliki udało się naprawić; użyj DISM z nośnika (Source) i powtórz.' }
+        default { $msgs += 'sfc: nie rozpoznano wyniku (inny język systemu?); sprawdź C:\Windows\Logs\CBS\CBS.log.' }
+    }
+    switch (ConvertFrom-DismCheckHealth -Text ($Check.Output -join "`n")) {
+        'healthy' { $msgs += 'DISM /CheckHealth: magazyn składników bez uszkodzeń.' }
+        'unknown' { $msgs += 'DISM /CheckHealth: nie rozpoznano wyniku (inny język systemu?).' }
+        default { $status = 'fail'; $msgs += 'DISM /CheckHealth: magazyn składników nadal uszkodzony.' }
+    }
+    return @{ Status = $status; Messages = $msgs }
+}
+
+function Get-SystemRepairModule {
+    return @{
+        Name  = 'system-repair'
+        Title = 'Naprawa plików systemowych'
+        Test  = { param($c) $true }
+        Plan  = { param($c) @('DISM /RestoreHealth (10-40 min)', 'sfc /scannow (10-30 min)', 'DISM /CheckHealth', 'Limit 60 min na krok; postęp widać na ekranie, wynik trafi do raportu.') }
+        Apply = {
+            param($c)
+            $restore = & $c.Runner 'dism.exe' @('/Online', '/Cleanup-Image', '/RestoreHealth') 3600
+            $sfc = & $c.Runner 'sfc.exe' @('/scannow') 3600
+            $check = & $c.Runner 'dism.exe' @('/Online', '/Cleanup-Image', '/CheckHealth') 600
+            return (Get-SystemRepairVerdict -Restore $restore -Sfc $sfc -Check $check)
+        }
+    }
+}
