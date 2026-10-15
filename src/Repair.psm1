@@ -1127,3 +1127,130 @@ function Get-StartupModule {
         }
     }
 }
+
+function Get-RepairModuleList {
+    return @((Get-SystemRepairModule), (Get-WindowsUpdateModule), (Get-CleanupModule), (Get-StartupModule))
+}
+
+function Resolve-RepairModules {
+    param([string[]]$Names = @())
+    $all = @(Get-RepairModuleList)
+    $known = @($all | ForEach-Object { $_.Name })
+    if (@($Names).Count -eq 0) { return @{ Valid = $true; Modules = $all; Error = '' } }
+    foreach ($n in $Names) {
+        if ($known -notcontains $n) {
+            return @{ Valid = $false; Modules = @(); Error = ('Nieznany moduł: {0}. Dostępne: {1}.' -f $n, ($known -join ', ')) }
+        }
+    }
+    return @{ Valid = $true; Modules = @($all | Where-Object { $Names -contains $_.Name }); Error = '' }
+}
+
+function Get-ModuleStatusLabel {
+    param([string]$Status)
+    switch ($Status) { 'done' { return 'wykonano' } 'skipped' { return 'pominięto' } 'declined' { return 'odrzucono' } 'fail' { return 'BŁĄD' } default { return $Status } }
+}
+
+function Format-RepairSummary {
+    param([Parameter(Mandatory)]$Gate, [Parameter(Mandatory)][AllowEmptyCollection()]$Results, $Diff = @())
+    $L = New-Object System.Collections.ArrayList
+    [void]$L.Add('PODSUMOWANIE NAPRAWY')
+    [void]$L.Add('')
+    [void]$L.Add('Bezpieczeństwo:')
+    foreach ($m in @($Gate.Messages)) { [void]$L.Add('  ' + $m) }
+    [void]$L.Add('')
+    [void]$L.Add('Moduły:')
+    foreach ($r in @($Results)) {
+        [void]$L.Add(('  {0}: {1}' -f $r.Name, (Get-ModuleStatusLabel $r.Status)))
+        foreach ($m in @($r.Messages)) { [void]$L.Add('    ' + $m) }
+    }
+    if (@($Diff).Count -gt 0) {
+        [void]$L.Add('')
+        [void]$L.Add('Przed i po:')
+        foreach ($d in @($Diff)) { [void]$L.Add('  ' + $d) }
+    }
+    return ($L -join "`n")
+}
+
+function New-DefaultRestorePointCreator {
+    return {
+        $w = @()
+        Checkpoint-Computer -Description 'WinResurect przed naprawą' -RestorePointType MODIFY_SETTINGS -WarningAction SilentlyContinue -WarningVariable w -ErrorAction Stop
+        @($w | ForEach-Object { "$_" })
+    }
+}
+
+function Invoke-RepairRun {
+    param(
+        [Parameter(Mandatory)][string]$WorkDir, [string[]]$Names = @(), [Parameter(Mandatory)]$Facts, $LastRun = $null,
+        [Nullable[datetime]]$ImageDate = $null, [string]$SkipReason = '', [datetime]$Now = (Get-Date),
+        [scriptblock]$Runner = (New-NativeRunner), [hashtable]$Ops = (Get-DefaultOps), [hashtable]$Collectors = (Get-DefaultCollectors),
+        [scriptblock]$Ask = { param($q) (Read-Host $q) -match '^[TtYy]' }, [scriptblock]$Prompt = { param($q) Read-Host $q },
+        [scriptblock]$RestorePointCreator = (New-DefaultRestorePointCreator), [scriptblock]$Say = { param($t) Write-Host $t },
+        [string]$SystemRoot = '', [hashtable]$Roots = $null
+    )
+    $sel = Resolve-RepairModules -Names $Names
+    if (-not $sel.Valid) { & $Say $sel.Error; return @{ ExitCode = 2; Messages = @($sel.Error); RunDir = ''; Results = @() } }
+    $gate = Invoke-RepairGate -Facts $Facts -LastRun $LastRun -Now $Now -ImageDate $ImageDate -SkipReason $SkipReason -Creator $RestorePointCreator -Ask $Ask
+    foreach ($m in $gate.Messages) { & $Say $m }
+    if (-not $gate.Allowed) { return @{ ExitCode = 2; Messages = @($gate.Messages); RunDir = ''; Results = @() } }
+
+    $runDir = New-RepairRunDir -WorkDir $WorkDir -Now $Now
+    & $Say 'Audyt przed naprawą (około minuty)...'
+    $before = Invoke-RepairAudit -Collectors $Collectors -Runner $Runner -Now $Now
+    Save-AuditFile -Audit $before -Dir $runDir -Name 'audit-before' | Out-Null
+
+    $ctxArgs = @{ Audit = $before; RunDir = $runDir; Ops = $Ops; Runner = $Runner; Ask = $Ask; Prompt = $Prompt; Now = $Now; SystemRoot = $SystemRoot }
+    if ($Roots) { $ctxArgs['Roots'] = $Roots }
+    $ctx = New-RepairContext @ctxArgs
+
+    $results = @()
+    foreach ($mod in $sel.Modules) {
+        & $Say ('--- {0} ---' -f $mod.Title)
+        $res = Invoke-RepairModule -Module $mod -Context $ctx
+        foreach ($m in $res.Messages) { & $Say ('  ' + $m) }
+        $results += $res
+    }
+
+    $after = $null; $diff = @()
+    if (@($results | Where-Object { $_.Status -eq 'done' }).Count -gt 0) {
+        & $Say 'Audyt po naprawie...'
+        $after = Invoke-RepairAudit -Collectors $Collectors -Runner $Runner -Now (Get-Date)
+        Save-AuditFile -Audit $after -Dir $runDir -Name 'audit-after' | Out-Null
+        $diff = @(Compare-Audits -Before $before -After $after)
+    }
+    $summary = Format-RepairSummary -Gate $gate -Results $results -Diff $diff
+    $text = $summary + "`n`n=== STAN PRZED ===`n" + (Format-AuditReport -Audit $before)
+    if ($after) { $text += "`n`n=== STAN PO ===`n" + (Format-AuditReport -Audit $after) }
+    $reportPath = Join-Path $runDir 'raport.txt'
+    Set-Content -LiteralPath $reportPath -Value $text -Encoding UTF8
+    & $Say ''
+    & $Say $summary
+    & $Say ('Raport: {0}' -f $reportPath)
+    $code = if (@($results | Where-Object { $_.Status -eq 'fail' }).Count -gt 0) { 1 } else { 0 }
+    return @{ ExitCode = $code; Messages = @($summary); RunDir = $runDir; Results = $results }
+}
+
+function Invoke-RepairUndo {
+    param(
+        [Parameter(Mandatory)][string]$WorkDir, [Parameter(Mandatory)][string]$Module, [hashtable]$Ops = (Get-DefaultOps),
+        [scriptblock]$Runner = (New-NativeRunner), [scriptblock]$Ask = { param($q) (Read-Host $q) -match '^[TtYy]' },
+        [scriptblock]$Say = { param($t) Write-Host $t }, [string]$SystemRoot = ''
+    )
+    $mod = @(Get-RepairModuleList | Where-Object { $_.Name -eq $Module })
+    if ($mod.Count -eq 0 -or -not $mod[0].ContainsKey('Undo')) {
+        $m = ('Moduł "{0}" nie obsługuje cofania (cofać można: startup, windows-update).' -f $Module)
+        & $Say $m
+        return @{ ExitCode = 2; Messages = @($m) }
+    }
+    $dir = Get-LatestUndoDir -WorkDir $WorkDir -Module $Module
+    if (-not $dir) { & $Say 'Brak zmian do cofnięcia.'; return @{ ExitCode = 0; Messages = @('Brak zmian do cofnięcia.') } }
+    $records = @(Read-UndoRecords -Dir $dir | Where-Object { $_.module -eq $Module -and -not (Test-UndoDone $_) })
+    if (-not (& $Ask ('Cofnąć {0} zmian(y) modułu {1} z przebiegu {2}? (t/n)' -f $records.Count, $Module, (Split-Path -Leaf $dir)))) {
+        return @{ ExitCode = 3; Messages = @('Przerwano.') }
+    }
+    $ctx = New-RepairContext -Audit $null -RunDir $dir -Ops $Ops -Runner $Runner -Ask $Ask -SystemRoot $SystemRoot
+    $msgs = @(& $mod[0].Undo $ctx $records)
+    foreach ($m in $msgs) { & $Say $m }
+    Set-UndoDone -Dir $dir -Module $Module
+    return @{ ExitCode = 0; Messages = $msgs }
+}

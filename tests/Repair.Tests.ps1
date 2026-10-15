@@ -969,3 +969,156 @@ Describe 'startup module' {
         @($msgs).Count | Should -BeGreaterThan 0
     }
 }
+
+Describe 'module selection' {
+    It 'returns all modules in the canonical order when no names are given' {
+        $r = Resolve-RepairModules -Names @()
+        $r.Valid | Should -BeTrue
+        ($r.Modules | ForEach-Object { $_.Name }) -join ',' | Should -Be 'system-repair,windows-update,cleanup,startup'
+    }
+    It 'keeps the canonical order whatever order the names come in' {
+        $r = Resolve-RepairModules -Names @('startup', 'cleanup')
+        ($r.Modules | ForEach-Object { $_.Name }) -join ',' | Should -Be 'cleanup,startup'
+    }
+    It 'rejects an unknown name and lists the valid ones' {
+        $r = Resolve-RepairModules -Names @('cleanup', 'bogus')
+        $r.Valid | Should -BeFalse
+        $r.Error | Should -Match 'bogus'
+        $r.Error | Should -Match 'system-repair'
+    }
+}
+
+Describe 'Format-RepairSummary' {
+    It 'shows the safety basis, every module outcome in Polish and the before/after lines' {
+        $gate = @{ Allowed = $true; Messages = @('Świeża kopia codzienna.', 'Utworzono punkt przywracania.') }
+        $res = @(@{ Name = 'cleanup'; Status = 'done'; Messages = @('Zwolniono ok. 3.0 GB') }, @{ Name = 'startup'; Status = 'declined'; Messages = @('Pominięte') }, @{ Name = 'windows-update'; Status = 'fail'; Messages = @('Błąd: x') })
+        $t = Format-RepairSummary -Gate $gate -Results $res -Diff @('Wolne miejsce: 10.0 GB -> 13.0 GB (odzyskano 3.0 GB)')
+        $t | Should -Match 'Świeża kopia codzienna'
+        $t | Should -Match 'cleanup: wykonano'
+        $t | Should -Match 'startup: odrzucono'
+        $t | Should -Match 'windows-update: BŁĄD'
+        $t | Should -Match 'odzyskano 3\.0 GB'
+    }
+}
+
+Describe 'Invoke-RepairRun' {
+    BeforeAll {
+        function New-RunCollectors {
+            @{
+                disk       = { param($r) @{ Disks = @(@{ Name = 'SSD'; Health = 'Healthy'; Wear = 1; Unreadable = 0 }) } }
+                space      = { param($r) @{ SystemDrive = 'C:'; Drives = @(@{ Drive = 'C:'; Free = 20GB; Total = 100GB }) } }
+                candidates = { param($r) @{ Sizes = [ordered]@{ 'recycle' = 1000 }; ComponentStoreCleanupRecommended = $false } }
+                boot       = { param($r) @{ Seconds = @(60) } }
+                startup    = { param($r) @{ Items = @() } }
+                integrity  = { param($r) @{ Dism = 'healthy'; SfcUnrepaired = 0 } }
+                updates    = { param($r) @{ StartTypes = @{}; DaysSinceInstall = 1; PendingReboot = $false; RepeatedErrorCode = $null } }
+                memory     = { param($r) @{ TotalGB = 16; UsedPct = 10; CrashCount = 0; TopProcesses = @() } }
+            }
+        }
+        $script:okFacts = @{ IsAdmin = $true; OnBattery = $false; SystemFreeBytes = 50GB; PendingReboot = $false }
+        $script:fresh = [pscustomobject]@{ status = 'ok'; last_success = (Get-Date).AddHours(-1).ToString('o') }
+        $script:said = New-Object System.Collections.ArrayList
+    }
+
+    It 'rejects an unknown module before touching anything' {
+        $w = Join-Path $TestDrive 'run-a'
+        $r = Invoke-RepairRun -WorkDir $w -Names @('bogus') -Facts $script:okFacts -LastRun $script:fresh -Say { param($t) } -Ask { $true } -Prompt { '' } -RestorePointCreator { @() }
+        $r.ExitCode | Should -Be 2
+        (Test-Path -LiteralPath (Join-Path $w 'repair')) | Should -BeFalse
+    }
+
+    It 'refuses without a fresh backup and creates no run folder' {
+        $w = Join-Path $TestDrive 'run-b'
+        $r = Invoke-RepairRun -WorkDir $w -Names @('cleanup') -Facts $script:okFacts -LastRun $null -Say { param($t) } -Ask { $true } -Prompt { '' } -RestorePointCreator { @() }
+        $r.ExitCode | Should -Be 2
+        (Test-Path -LiteralPath (Join-Path $w 'repair')) | Should -BeFalse
+    }
+
+    It 'runs the chosen module, saves before and after audits and the report, and exits 0' {
+        $w = Join-Path $TestDrive 'run-c'
+        $fr = New-FakeRunner
+        $ops = New-FakeOps
+        $r = Invoke-RepairRun -WorkDir $w -Names @('cleanup') -Facts $script:okFacts -LastRun $script:fresh `
+            -Collectors (New-RunCollectors) -Runner $fr.Runner -Ops $ops.Ops -Ask { $true } -Prompt { '' } -RestorePointCreator { @() } -Say { param($t) } `
+            -Roots @{ 'temp-user' = @(); 'temp-win' = @(); 'wu-download' = @(); 'dumps' = @() }
+        $r.ExitCode | Should -Be 0
+        foreach ($f in 'audit-before.json', 'audit-after.json', 'raport.txt') { (Test-Path -LiteralPath (Join-Path $r.RunDir $f)) | Should -BeTrue -Because $f }
+        $ops.Log | Should -Contain 'recycle'
+        (Get-Content -LiteralPath (Join-Path $r.RunDir 'raport.txt') -Raw -Encoding UTF8) | Should -Match 'STAN PRZED'
+    }
+
+    It 'skips the after audit when nothing was done' {
+        $w = Join-Path $TestDrive 'run-d'
+        $r = Invoke-RepairRun -WorkDir $w -Names @('cleanup') -Facts $script:okFacts -LastRun $script:fresh -Collectors (New-RunCollectors) `
+            -Runner (New-FakeRunner).Runner -Ops (New-FakeOps).Ops -Ask { $false } -Prompt { '' } -RestorePointCreator { @() } -Say { param($t) } `
+            -Roots @{ 'temp-user' = @(); 'temp-win' = @(); 'wu-download' = @(); 'dumps' = @() }
+        $r.ExitCode | Should -Be 0
+        (Test-Path -LiteralPath (Join-Path $r.RunDir 'audit-after.json')) | Should -BeFalse
+    }
+
+    It 'exits 1 when a module fails but still runs the remaining ones' {
+        $w = Join-Path $TestDrive 'run-e'
+        $ops = New-FakeOps -States @{ BITS = 'Running'; wuauserv = 'Running'; appidsvc = 'Running'; cryptsvc = 'Running' } -FailRename
+        $sr = Join-Path $TestDrive 'sr-e'
+        New-Item -ItemType Directory -Force -Path (Join-Path $sr 'SoftwareDistribution') | Out-Null
+        $r = Invoke-RepairRun -WorkDir $w -Names @('windows-update', 'cleanup') -Facts $script:okFacts -LastRun $script:fresh -Collectors (New-RunCollectors) `
+            -Runner (New-FakeRunner).Runner -Ops $ops.Ops -Ask { $true } -Prompt { '' } -RestorePointCreator { @() } -Say { param($t) } -SystemRoot $sr `
+            -Roots @{ 'temp-user' = @(); 'temp-win' = @(); 'wu-download' = @(); 'dumps' = @() }
+        $r.ExitCode | Should -Be 1
+        @($r.Results).Count | Should -Be 2
+        (@($r.Results) | Where-Object { $_.Name -eq 'windows-update' }).Status | Should -Be 'fail'
+        (@($r.Results) | Where-Object { $_.Name -eq 'cleanup' }).Status | Should -Be 'done'
+    }
+}
+
+Describe 'Invoke-RepairUndo' {
+    It 'asks, re-enables the recorded startup items from the newest run and marks them undone' {
+        $w = Join-Path $TestDrive 'undo-a'
+        $dir = Join-Path (Join-Path $w 'repair') '20261010-100000'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Add-UndoRecord -Dir $dir -Record @{ module = 'startup'; kind = 'task'; name = 'Adobe'; location = '\' }
+        $ops = New-FakeOps
+        $r = Invoke-RepairUndo -WorkDir $w -Module 'startup' -Ops $ops.Ops -Ask { $true } -Say { param($t) }
+        $r.ExitCode | Should -Be 0
+        $ops.Log | Should -Contain 'enable:Adobe'
+        Get-LatestUndoDir -WorkDir $w -Module 'startup' | Should -BeNullOrEmpty
+    }
+    It 'does nothing when the answer is no' {
+        $w = Join-Path $TestDrive 'undo-b'
+        $dir = Join-Path (Join-Path $w 'repair') '20261010-100000'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Add-UndoRecord -Dir $dir -Record @{ module = 'startup'; kind = 'task'; name = 'Adobe'; location = '\' }
+        $ops = New-FakeOps
+        $r = Invoke-RepairUndo -WorkDir $w -Module 'startup' -Ops $ops.Ops -Ask { $false } -Say { param($t) }
+        $r.ExitCode | Should -Be 3
+        $ops.Log.Count | Should -Be 0
+    }
+    It 'says there is nothing to undo, and refuses modules that cannot be undone' {
+        $w = Join-Path $TestDrive 'undo-c'
+        (Invoke-RepairUndo -WorkDir $w -Module 'startup' -Ask { $true } -Say { param($t) }).ExitCode | Should -Be 0
+        (Invoke-RepairUndo -WorkDir $w -Module 'cleanup' -Ask { $true } -Say { param($t) }).ExitCode | Should -Be 2
+        (Invoke-RepairUndo -WorkDir $w -Module 'bogus' -Ask { $true } -Say { param($t) }).ExitCode | Should -Be 2
+    }
+}
+
+Describe 'repair entry script' {
+    BeforeAll {
+        $script:rootDir = Split-Path $PSScriptRoot -Parent
+        $script:pwshExe = (Get-Process -Id $PID).Path
+        function Invoke-Entry([string[]]$ArgList) {
+            Push-Location $script:rootDir
+            try { & $script:pwshExe -NoProfile -File @ArgList *> $null; return $LASTEXITCODE } finally { Pop-Location }
+        }
+    }
+    It 'refuses -Yes with exit code 2' {
+        Invoke-Entry @((Join-Path $script:rootDir 'Repair-Windows.ps1'), '-Yes') | Should -Be 2
+    }
+    It 'rejects an unknown module and a malformed image date with exit code 2' {
+        Invoke-Entry @((Join-Path $script:rootDir 'Repair-Windows.ps1'), '-Modules', 'bogus') | Should -Be 2
+        Invoke-Entry @((Join-Path $script:rootDir 'Repair-Windows.ps1'), '-ImageDate', '2026-13-45') | Should -Be 2
+    }
+    It 'is reachable through Invoke-Resurect.ps1 -Action repair and keeps the same refusals' {
+        Invoke-Entry @((Join-Path $script:rootDir 'Invoke-Resurect.ps1'), '-Action', 'repair', '-Yes') | Should -Be 2
+        Invoke-Entry @((Join-Path $script:rootDir 'Invoke-Resurect.ps1'), '-Action', 'repair', '-Modules', 'bogus') | Should -Be 2
+    }
+}

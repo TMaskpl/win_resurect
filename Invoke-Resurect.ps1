@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet('image', 'install-daily', 'status', 'restore', 'remove-daily', 'audit')][string]$Action,
+    [ValidateSet('image', 'install-daily', 'status', 'restore', 'remove-daily', 'audit', 'repair')][string]$Action,
     [ValidateSet('usb', 'smb')][string]$Target,
     [string]$Drive,
     [string]$Label,
@@ -8,6 +8,10 @@ param(
     [string]$User,
     [string]$Folder,
     [string]$Time,
+    [string[]]$Modules,
+    [string]$Undo,
+    [string]$ImageDate,
+    [string]$SkipBackupCheck,
     [switch]$Yes,
     [string]$Root
 )
@@ -32,7 +36,8 @@ if (-not $Action) {
         Write-Host '4) Przywróć pliki z kopii codziennej'
         Write-Host '5) Usuń kopię codzienną'
         Write-Host '6) Audyt systemu (tylko odczyt)'
-        $choice = Read-Host 'Wybierz (1-6)'
+        Write-Host '7) Naprawa i czyszczenie systemu'
+        $choice = Read-Host 'Wybierz (1-7)'
         switch ($choice) {
             '1' { $Action = 'image' }
             '2' { $Action = 'install-daily' }
@@ -40,18 +45,20 @@ if (-not $Action) {
             '4' { $Action = 'restore' }
             '5' { $Action = 'remove-daily' }
             '6' { $Action = 'audit' }
+            '7' { $Action = 'repair' }
             default { Write-Host 'Przerwano.'; exit 3 }
         }
     }
 }
 
 if ($Action -ne 'image') {
-    $files = @{ 'install-daily' = 'Install-DailyBackup.ps1'; 'status' = 'Get-DailyStatus.ps1'; 'restore' = 'Restore-DailyBackup.ps1'; 'remove-daily' = 'Remove-DailyBackup.ps1'; 'audit' = 'Get-WinAudit.ps1' }
+    $files = @{ 'install-daily' = 'Install-DailyBackup.ps1'; 'status' = 'Get-DailyStatus.ps1'; 'restore' = 'Restore-DailyBackup.ps1'; 'remove-daily' = 'Remove-DailyBackup.ps1'; 'audit' = 'Get-WinAudit.ps1'; 'repair' = 'Repair-Windows.ps1' }
     $splat = @{ Root = $root }
     if ($Action -eq 'install-daily') {
         foreach ($k in 'Target', 'Label', 'Share', 'User', 'Folder', 'Time') { if ((Get-Variable $k).Value) { $splat[$k] = (Get-Variable $k).Value } }
     }
-    if ($Yes -and $Action -eq 'remove-daily') { $splat['Yes'] = $true }
+    if ($Action -eq 'repair') { foreach ($k in 'Modules', 'Undo', 'ImageDate', 'SkipBackupCheck') { if ((Get-Variable $k).Value) { $splat[$k] = (Get-Variable $k).Value } } }
+    if ($Yes -and $Action -in 'remove-daily', 'repair') { $splat['Yes'] = $true }
     & ([scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $root $files[$Action])))) @splat
     exit 0
 }
