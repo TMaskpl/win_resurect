@@ -332,3 +332,175 @@ Describe 'audit entry script' {
         finally { Remove-Item Env:WINRES_HOME -ErrorAction SilentlyContinue }
     }
 }
+
+Describe 'Get-RepairPreflightErrors' {
+    It 'refuses without admin, on battery, with a pending reboot or with too little free space' {
+        $ok = @{ IsAdmin = $true; OnBattery = $false; SystemFreeBytes = 50GB; PendingReboot = $false }
+        (Get-RepairPreflightErrors -Facts $ok).Errors.Count | Should -Be 0
+        $bad = $ok.Clone(); $bad.IsAdmin = $false
+        (Get-RepairPreflightErrors -Facts $bad).Errors | Should -Match 'administrator'
+        $bad = $ok.Clone(); $bad.OnBattery = $true
+        (Get-RepairPreflightErrors -Facts $bad).Errors | Should -Match 'baterii'
+        $bad = $ok.Clone(); $bad.PendingReboot = $true
+        (Get-RepairPreflightErrors -Facts $bad).Errors | Should -Match 'restart'
+        $bad = $ok.Clone(); $bad.SystemFreeBytes = 1GB
+        (Get-RepairPreflightErrors -Facts $bad).Errors | Should -Match 'miejsca'
+    }
+}
+
+Describe 'Get-RepairFacts' {
+    It 'never throws and always returns the four facts, even where Windows APIs are missing' {
+        { Get-RepairFacts } | Should -Not -Throw
+        $f = Get-RepairFacts
+        foreach ($k in 'IsAdmin', 'OnBattery', 'SystemFreeBytes', 'PendingReboot') { $f.ContainsKey($k) | Should -BeTrue -Because $k }
+    }
+}
+
+Describe 'Get-BackupGate' {
+    BeforeAll {
+        $script:now = [datetime]'2026-10-15T12:00:00'
+        function New-Run($status, $hoursAgo) {
+            [pscustomobject]@{ status = $status; last_success = $script:now.AddHours(-$hoursAgo).ToString('o') }
+        }
+    }
+    It 'accepts a fresh daily backup' {
+        $g = Get-BackupGate -LastRun (New-Run 'ok' 5) -Now $script:now
+        $g.Allowed | Should -BeTrue
+        $g.Basis | Should -Be 'daily'
+    }
+    It 'refuses a stale daily backup and a failed one' {
+        (Get-BackupGate -LastRun (New-Run 'ok' 49) -Now $script:now).Allowed | Should -BeFalse
+        (Get-BackupGate -LastRun (New-Run 'fail' 5) -Now $script:now).Allowed | Should -BeFalse
+        (Get-BackupGate -LastRun $null -Now $script:now).Allowed | Should -BeFalse
+    }
+    It 'accepts a declared image up to 30 days old and nothing older or from the future' {
+        (Get-BackupGate -LastRun $null -Now $script:now -ImageDate ([datetime]'2026-09-20')).Basis | Should -Be 'image'
+        (Get-BackupGate -LastRun $null -Now $script:now -ImageDate ([datetime]'2026-09-10')).Allowed | Should -BeFalse
+        (Get-BackupGate -LastRun $null -Now $script:now -ImageDate ([datetime]'2026-12-01')).Allowed | Should -BeFalse
+    }
+    It 'lets a written reason skip the check and records it, but not a blank one' {
+        $g = Get-BackupGate -LastRun $null -Now $script:now -SkipReason 'klient ma kopię w chmurze'
+        $g.Allowed | Should -BeTrue
+        $g.Basis | Should -Be 'skip'
+        $g.Message | Should -Match 'chmurze'
+        (Get-BackupGate -LastRun $null -Now $script:now -SkipReason '   ').Allowed | Should -BeFalse
+    }
+    It 'tells the technician how to proceed when refusing' {
+        (Get-BackupGate -LastRun $null -Now $script:now).Message | Should -Match 'ImageDate'
+    }
+}
+
+Describe 'Test-SafeDeleteTarget' {
+    BeforeAll { $script:allowed = @('C:\Windows\Temp', 'C:\Users\Jan\AppData\Local\Temp') }
+    It 'accepts the allowed root and anything below it, ignoring case and slashes' {
+        Test-SafeDeleteTarget -Path 'C:\Windows\Temp' -AllowedRoots $script:allowed | Should -BeTrue
+        Test-SafeDeleteTarget -Path 'c:\windows\temp\sub\x.tmp' -AllowedRoots $script:allowed | Should -BeTrue
+        Test-SafeDeleteTarget -Path 'C:/Windows/Temp/sub' -AllowedRoots $script:allowed | Should -BeTrue
+    }
+    It 'rejects empty, relative, parent-traversing and drive-root paths' {
+        foreach ($p in '', '   ', '\Temp', 'Temp', '..\Temp', 'C:\Windows\Temp\..\System32', 'C:\', 'C:', '/') {
+            Test-SafeDeleteTarget -Path $p -AllowedRoots $script:allowed | Should -BeFalse -Because "'$p'"
+        }
+    }
+    It 'rejects look-alike siblings and paths above the root' {
+        Test-SafeDeleteTarget -Path 'C:\Windows\Temporary' -AllowedRoots $script:allowed | Should -BeFalse
+        Test-SafeDeleteTarget -Path 'C:\Windows' -AllowedRoots $script:allowed | Should -BeFalse
+        Test-SafeDeleteTarget -Path 'C:\Windows\System32' -AllowedRoots $script:allowed | Should -BeFalse
+    }
+    It 'never treats a drive root or a blank entry as an allowed root' {
+        Test-SafeDeleteTarget -Path 'C:\Windows\Temp' -AllowedRoots @('C:\', '', 'C:') | Should -BeFalse
+        Test-SafeDeleteTarget -Path 'C:\Windows\Temp' -AllowedRoots @() | Should -BeFalse
+    }
+}
+
+Describe 'Remove-FolderContents' {
+    It 'deletes the contents but keeps the folder, and counts freed bytes' {
+        $d = Join-Path $TestDrive 'rf1'
+        New-Item -ItemType Directory -Force -Path (Join-Path $d 'sub') | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $d 'a.bin'), (New-Object byte[] 1000))
+        [System.IO.File]::WriteAllBytes((Join-Path $d 'sub/b.bin'), (New-Object byte[] 500))
+        $r = Remove-FolderContents -Path $d -AllowedRoots @($d)
+        $r.FreedBytes | Should -Be 1500
+        (Test-Path -LiteralPath $d) | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $d -Force).Count | Should -Be 0
+    }
+    It 'keeps files newer than the age limit' {
+        $d = Join-Path $TestDrive 'rf2'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        $old = Join-Path $d 'old.tmp'; $new = Join-Path $d 'new.tmp'
+        Set-Content -LiteralPath $old -Value 'x'; Set-Content -LiteralPath $new -Value 'x'
+        (Get-Item $old).LastWriteTime = (Get-Date).AddDays(-30)
+        $r = Remove-FolderContents -Path $d -AllowedRoots @($d) -OlderThanDays 7
+        (Test-Path -LiteralPath $old) | Should -BeFalse
+        (Test-Path -LiteralPath $new) | Should -BeTrue
+        $r.Skipped | Should -Be 1
+    }
+    It 'refuses a path outside the allowed roots without touching anything' {
+        $d = Join-Path $TestDrive 'rf3'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        Set-Content -LiteralPath (Join-Path $d 'keep.txt') -Value 'x'
+        { Remove-FolderContents -Path $d -AllowedRoots @((Join-Path $TestDrive 'inny')) } | Should -Throw '*Odmowa*'
+        (Test-Path -LiteralPath (Join-Path $d 'keep.txt')) | Should -BeTrue
+    }
+    It 'does not follow links: data behind a link stays intact (and the linked folder is skipped)' -Skip:([Environment]::OSVersion.Platform -eq 'Win32NT') {
+        $outside = Join-Path $TestDrive 'outside'
+        New-Item -ItemType Directory -Force -Path $outside | Out-Null
+        Set-Content -LiteralPath (Join-Path $outside 'precious.txt') -Value 'x'
+        $d = Join-Path $TestDrive 'rf4'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        New-Item -ItemType SymbolicLink -Path (Join-Path $d 'link') -Target $outside | Out-Null
+        $nested = Join-Path $d 'wrap'
+        New-Item -ItemType Directory -Force -Path $nested | Out-Null
+        New-Item -ItemType SymbolicLink -Path (Join-Path $nested 'link2') -Target $outside | Out-Null
+        $r = Remove-FolderContents -Path $d -AllowedRoots @($d)
+        (Test-Path -LiteralPath (Join-Path $outside 'precious.txt')) | Should -BeTrue
+        $r.Skipped | Should -BeGreaterOrEqual 2
+    }
+}
+
+Describe 'New-SafetyRestorePoint' {
+    It 'reports success, failure and warnings from the creator' {
+        (New-SafetyRestorePoint -Creator { @() }).Created | Should -BeTrue
+        $w = New-SafetyRestorePoint -Creator { @('Punkt utworzono mniej niż 24 h temu') }
+        $w.Created | Should -BeFalse
+        $w.Message | Should -Match '24 h'
+        $f = New-SafetyRestorePoint -Creator { throw 'Ochrona systemu wyłączona' }
+        $f.Created | Should -BeFalse
+        $f.Message | Should -Match 'wyłączona'
+    }
+}
+
+Describe 'Invoke-RepairGate' {
+    BeforeAll {
+        $script:okFacts = @{ IsAdmin = $true; OnBattery = $false; SystemFreeBytes = 50GB; PendingReboot = $false }
+        $script:now = [datetime]'2026-10-15T12:00:00'
+        $script:fresh = [pscustomobject]@{ status = 'ok'; last_success = $script:now.AddHours(-2).ToString('o') }
+    }
+    It 'allows when preflight, backup and restore point are all fine' {
+        $g = Invoke-RepairGate -Facts $script:okFacts -LastRun $script:fresh -Now $script:now -Creator { @() } -Ask { $true }
+        $g.Allowed | Should -BeTrue
+        $g.RestorePoint | Should -BeTrue
+    }
+    It 'stops at the first refusal and does not create a restore point' {
+        $script:called = $false
+        $noAdmin = $script:okFacts.Clone(); $noAdmin.IsAdmin = $false
+        $g = Invoke-RepairGate -Facts $noAdmin -LastRun $script:fresh -Now $script:now -Creator { $script:called = $true; @() } -Ask { $true }
+        $g.Allowed | Should -BeFalse
+        $script:called | Should -BeFalse
+        $g2 = Invoke-RepairGate -Facts $script:okFacts -LastRun $null -Now $script:now -Creator { $script:called = $true; @() } -Ask { $true }
+        $g2.Allowed | Should -BeFalse
+        $script:called | Should -BeFalse
+    }
+    It 'asks before continuing without a restore point and obeys the answer' {
+        $yes = Invoke-RepairGate -Facts $script:okFacts -LastRun $script:fresh -Now $script:now -Creator { throw 'x' } -Ask { $true }
+        $yes.Allowed | Should -BeTrue
+        $yes.RestorePoint | Should -BeFalse
+        $no = Invoke-RepairGate -Facts $script:okFacts -LastRun $script:fresh -Now $script:now -Creator { throw 'x' } -Ask { $false }
+        $no.Allowed | Should -BeFalse
+    }
+    It 'carries the skip reason into the messages' {
+        $g = Invoke-RepairGate -Facts $script:okFacts -LastRun $null -Now $script:now -SkipReason 'kopia w chmurze' -Creator { @() } -Ask { $true }
+        $g.Allowed | Should -BeTrue
+        ($g.Messages -join ' ') | Should -Match 'kopia w chmurze'
+    }
+}

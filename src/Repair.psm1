@@ -610,3 +610,121 @@ function Save-AuditFile {
     $Audit | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $p -Encoding UTF8
     return $p
 }
+
+function Get-RepairFacts {
+    $free = $null
+    try {
+        $sd = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+        $free = [long](Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $sd) -ErrorAction Stop).FreeSpace
+    }
+    catch { }
+    $battery = $false
+    try { $battery = [bool](Test-OnBattery) } catch { }
+    return @{ IsAdmin = (Test-IsAdmin); OnBattery = $battery; SystemFreeBytes = $free; PendingReboot = (Test-PendingReboot) }
+}
+
+function Get-RepairPreflightErrors {
+    param([Parameter(Mandatory)]$Facts)
+    $errors = @(); $warnings = @()
+    if (-not $Facts.IsAdmin) { $errors += 'Uruchom jako administrator (Start.cmd robi to automatycznie).' }
+    if ($Facts.OnBattery) { $errors += 'Komputer pracuje na baterii: podłącz zasilanie, naprawa trwa długo.' }
+    if ($Facts.PendingReboot) { $errors += 'Czeka restart systemu: uruchom komputer ponownie i spróbuj jeszcze raz.' }
+    if ($null -eq $Facts.SystemFreeBytes) { $warnings += 'Nie można sprawdzić wolnego miejsca na dysku systemowym.' }
+    elseif ([long]$Facts.SystemFreeBytes -lt 2GB) { $errors += 'Za mało wolnego miejsca na dysku systemowym (potrzeba co najmniej 2 GB na narzędzia naprawcze).' }
+    return @{ Errors = @($errors); Warnings = @($warnings) }
+}
+
+function Get-BackupGate {
+    param($LastRun, [Parameter(Mandatory)][datetime]$Now, [Nullable[datetime]]$ImageDate = $null, [string]$SkipReason = '')
+    if ($SkipReason -and $SkipReason.Trim()) {
+        return @{ Allowed = $true; Basis = 'skip'; Message = ('Kontrola kopii pominięta, powód: {0}' -f $SkipReason.Trim()) }
+    }
+    if ($LastRun -and (Get-ConfigValue $LastRun 'status' '') -ne 'fail' -and (Get-DailyStaleness -LastRun $LastRun -Now $Now) -eq 'fresh') {
+        return @{ Allowed = $true; Basis = 'daily'; Message = 'Świeża kopia codzienna (ostatni sukces w ciągu 48 h).' }
+    }
+    if ($null -ne $ImageDate) {
+        $age = ($Now - ([datetime]$ImageDate)).TotalDays
+        if ($age -le 30 -and $age -ge -1) {
+            return @{ Allowed = $true; Basis = 'image'; Message = ('Obraz systemu z {0} (zadeklarowany przez technika).' -f ([datetime]$ImageDate).ToString('yyyy-MM-dd')) }
+        }
+    }
+    return @{ Allowed = $false; Basis = 'none'; Message = 'Brak świeżej kopii: wykonaj kopię codzienną albo obraz systemu (faza 0) i podaj -ImageDate RRRR-MM-DD, albo użyj -SkipBackupCheck "powód".' }
+}
+
+function ConvertTo-NormalizedPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $p = $Path.Trim()
+    if ($p -match '^[A-Za-z]:') { return $p.Replace('/', '\').TrimEnd('\') }
+    return $p.TrimEnd('/')
+}
+
+function Test-SafeDeleteTarget {
+    param([string]$Path, [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$AllowedRoots)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if ($Path -match '(^|[\\/])\.\.([\\/]|$)') { return $false }
+    $p = ConvertTo-NormalizedPath -Path $Path
+    if ($p -notmatch '^([A-Za-z]:\\|/)[^\\/]') { return $false }
+    $sep = if ($p -match '^[A-Za-z]:') { '\' } else { '/' }
+    $pl = $p.ToLowerInvariant()
+    foreach ($r in $AllowedRoots) {
+        $rn = ConvertTo-NormalizedPath -Path $r
+        if ($rn -notmatch '^([A-Za-z]:\\|/)[^\\/]') { continue }
+        $rl = $rn.ToLowerInvariant()
+        if ($pl -eq $rl -or $pl.StartsWith($rl + $sep)) { return $true }
+    }
+    return $false
+}
+
+function Remove-FolderContents {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$AllowedRoots, [int]$OlderThanDays = 0, [datetime]$Now = (Get-Date))
+    $res = @{ FreedBytes = 0L; Failed = 0; Skipped = 0 }
+    if (-not (Test-SafeDeleteTarget -Path $Path -AllowedRoots $AllowedRoots)) { throw ('Odmowa: ścieżka poza dozwolonymi katalogami: {0}' -f $Path) }
+    if (-not (Test-Path -LiteralPath $Path)) { return $res }
+    $cut = $Now.AddDays(-$OlderThanDays)
+    foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        if ($item.LinkType) { $res.Skipped++; continue }
+        if ($OlderThanDays -gt 0 -and $item.LastWriteTime -gt $cut) { $res.Skipped++; continue }
+        if ($item.PSIsContainer) {
+            $links = @(Get-ChildItem -LiteralPath $item.FullName -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
+            if ($links.Count -gt 0) { $res.Skipped++; continue }
+            $size = Get-DirectorySize -Path $item.FullName
+        }
+        else { $size = [long]$item.Length }
+        try { Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop; $res.FreedBytes += $size }
+        catch { $res.Failed++ }
+    }
+    return $res
+}
+
+function New-SafetyRestorePoint {
+    param([Parameter(Mandatory)][scriptblock]$Creator)
+    try {
+        $w = @(& $Creator | Where-Object { $_ })
+        if ($w.Count -gt 0) { return @{ Created = $false; Message = ($w -join '; ') } }
+        return @{ Created = $true; Message = 'Utworzono punkt przywracania.' }
+    }
+    catch { return @{ Created = $false; Message = $_.Exception.Message } }
+}
+
+function Invoke-RepairGate {
+    param(
+        [Parameter(Mandatory)]$Facts, $LastRun, [Parameter(Mandatory)][datetime]$Now,
+        [Nullable[datetime]]$ImageDate = $null, [string]$SkipReason = '',
+        [Parameter(Mandatory)][scriptblock]$Creator, [Parameter(Mandatory)][scriptblock]$Ask
+    )
+    $msgs = @()
+    $pre = Get-RepairPreflightErrors -Facts $Facts
+    foreach ($w in $pre.Warnings) { $msgs += "Uwaga: $w" }
+    if ($pre.Errors.Count -gt 0) {
+        return @{ Allowed = $false; Messages = @($msgs + $pre.Errors); RestorePoint = $false; Basis = 'none' }
+    }
+    $bk = Get-BackupGate -LastRun $LastRun -Now $Now -ImageDate $ImageDate -SkipReason $SkipReason
+    $msgs += $bk.Message
+    if (-not $bk.Allowed) { return @{ Allowed = $false; Messages = @($msgs); RestorePoint = $false; Basis = $bk.Basis } }
+    $rp = New-SafetyRestorePoint -Creator $Creator
+    if ($rp.Created) { $msgs += $rp.Message; return @{ Allowed = $true; Messages = @($msgs); RestorePoint = $true; Basis = $bk.Basis } }
+    $q = "Nie utworzono punktu przywracania ($($rp.Message)). Podstawa bezpieczeństwa: $($bk.Message) Kontynuować bez punktu? (t/n)"
+    if (& $Ask $q) { $msgs += 'Kontynuacja bez punktu przywracania (decyzja technika).'; return @{ Allowed = $true; Messages = @($msgs); RestorePoint = $false; Basis = $bk.Basis } }
+    return @{ Allowed = $false; Messages = @($msgs + 'Przerwano: brak punktu przywracania.'); RestorePoint = $false; Basis = $bk.Basis }
+}
