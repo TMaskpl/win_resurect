@@ -164,3 +164,171 @@ Describe 'report and diff' {
         @(Compare-Audits -Before $b -After $a).Count | Should -Be 0
     }
 }
+
+Describe 'Invoke-NativeCommand' {
+    BeforeAll { $script:pwsh = (Get-Process -Id $PID).Path }
+
+    It 'returns the exit code and the output lines' {
+        $r = Invoke-NativeCommand -Exe $script:pwsh -ArgList @('-NoProfile', '-Command', 'Write-Output hello; exit 3') -Quiet
+        $r.ExitCode | Should -Be 3
+        $r.Output | Should -Contain 'hello'
+        $r.TimedOut | Should -BeFalse
+    }
+
+    It 'stops waiting after the timeout and says so' {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-NativeCommand -Exe $script:pwsh -ArgList @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60') -TimeoutSec 3 -Quiet
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 30
+        $r.TimedOut | Should -BeTrue
+        $r.ExitCode | Should -Be -1
+    }
+
+    It 'treats a missing program as a failure instead of throwing' {
+        $r = Invoke-NativeCommand -Exe 'definitely-not-a-program-xyz' -ArgList @() -Quiet
+        $r.ExitCode | Should -Not -Be 0
+    }
+
+    It 'wraps the same behaviour in a runner scriptblock' {
+        $runner = New-NativeRunner -Quiet
+        $r = & $runner $script:pwsh @('-NoProfile', '-Command', 'exit 7') 0
+        $r.ExitCode | Should -Be 7
+    }
+}
+
+Describe 'cleanup roots' {
+    It 'builds absolute paths from the system root and the users directory' {
+        $r = Get-CleanupRoots -SystemRoot 'C:\Windows' -UsersDir (Join-Path $TestDrive 'nousers')
+        $r['temp-win'] | Should -Contain 'C:\Windows\Temp'
+        $r['wu-download'] | Should -Contain 'C:\Windows\SoftwareDistribution\Download'
+        $r['dumps'] | Should -Contain 'C:\Windows\Minidump'
+    }
+
+    It 'falls back to C:\Windows when the system root is empty, never to a relative path' {
+        $r = Get-CleanupRoots -SystemRoot '' -UsersDir (Join-Path $TestDrive 'nousers')
+        foreach ($k in $r.Keys) { foreach ($p in $r[$k]) { $p | Should -Match '^[A-Za-z]:\\' } }
+        $r['temp-win'] | Should -Contain 'C:\Windows\Temp'
+    }
+
+    It 'lists the Temp folder of every profile' {
+        $users = Join-Path $TestDrive 'Users'
+        New-Item -ItemType Directory -Force -Path (Join-Path $users 'Jan'), (Join-Path $users 'Ewa') | Out-Null
+        $r = Get-CleanupRoots -SystemRoot 'C:\Windows' -UsersDir $users
+        @($r['temp-user']).Count | Should -Be 2
+        @($r['temp-user'])[0] | Should -Match 'AppData\\Local\\Temp$'
+    }
+}
+
+Describe 'Get-DirectorySize' {
+    It 'sums file sizes recursively and returns 0 for a missing folder' {
+        $d = Join-Path $TestDrive 'sz'
+        New-Item -ItemType Directory -Force -Path (Join-Path $d 'sub') | Out-Null
+        [System.IO.File]::WriteAllBytes((Join-Path $d 'a.bin'), (New-Object byte[] 1000))
+        [System.IO.File]::WriteAllBytes((Join-Path $d 'sub/b.bin'), (New-Object byte[] 500))
+        Get-DirectorySize -Path $d | Should -Be 1500
+        Get-DirectorySize -Path (Join-Path $TestDrive 'nie-ma') | Should -Be 0
+    }
+}
+
+Describe 'Test-ProtectedStartupItem' {
+    It 'protects Microsoft entries, security software and folder shortcuts' {
+        Test-ProtectedStartupItem -Item @{ Name = 'OneDrive'; Publisher = 'Microsoft Corporation'; Kind = 'run' } | Should -BeTrue
+        Test-ProtectedStartupItem -Item @{ Name = 'ekrn'; Publisher = 'ESET, spol. s r.o.'; Kind = 'service' } | Should -BeTrue
+        Test-ProtectedStartupItem -Item @{ Name = 'MBAMService'; Publisher = 'Malwarebytes'; Kind = 'service' } | Should -BeTrue
+        Test-ProtectedStartupItem -Item @{ Name = 'skrot'; Publisher = ''; Kind = 'folder' } | Should -BeTrue
+        Test-ProtectedStartupItem -Item @{ Name = 'Spotify'; Publisher = 'Spotify AB'; Kind = 'run' } | Should -BeFalse
+    }
+}
+
+Describe 'Invoke-RepairAudit' {
+    BeforeAll {
+        function New-OkCollectors {
+            @{
+                disk       = { param($r) @{ Disks = @(@{ Name = 'SSD'; Health = 'Healthy'; Wear = 10; Unreadable = 0 }) } }
+                space      = { param($r) @{ SystemDrive = 'C:'; Drives = @(@{ Drive = 'C:'; Free = 20GB; Total = 100GB }) } }
+                candidates = { param($r) @{ Sizes = [ordered]@{ 'recycle' = 2GB; 'temp-user' = 1GB }; ComponentStoreCleanupRecommended = $true } }
+                boot       = { param($r) @{ Seconds = @(100, 120) } }
+                startup    = { param($r) @{ Items = @(@{ Name = 'A'; Kind = 'run'; Command = 'a.exe'; Publisher = 'X'; Location = 'HKLM'; Disableable = $true; Reason = '' }) } }
+                integrity  = { param($r) @{ Dism = 'healthy'; SfcUnrepaired = 0 } }
+                updates    = { param($r) @{ StartTypes = @{ wuauserv = 'Manual' }; DaysSinceInstall = 5; PendingReboot = $false; RepeatedErrorCode = $null } }
+                memory     = { param($r) @{ TotalGB = 16; UsedPct = 40; CrashCount = 0; TopProcesses = @('chrome (1.0 GB)') } }
+            }
+        }
+    }
+
+    It 'turns the facts into rated findings, candidates, startup items and metrics' {
+        $a = Invoke-RepairAudit -Collectors (New-OkCollectors) -Runner { } -Now ([datetime]'2026-10-15T10:00:00') -ComputerName 'PC1'
+        $a.computer | Should -Be 'PC1'
+        @($a.findings).Count | Should -Be 6
+        (@($a.findings) | Where-Object group -eq 'boot').status | Should -Be 'warn'
+        (@($a.findings) | Where-Object group -eq 'space').status | Should -Be 'ok'
+        $a.candidates[0].id | Should -Be 'recycle'
+        $a.componentStore | Should -BeTrue
+        @($a.startup).Count | Should -Be 1
+        (Get-AuditMetric -Audit $a -Name 'FreeBytes') | Should -Be 20GB
+        (Get-AuditMetric -Audit $a -Name 'BootAvgSec') | Should -Be 110
+        (Get-AuditMetric -Audit $a -Name 'StartupCount') | Should -Be 1
+        (Get-AuditMetric -Audit $a -Name 'IntegrityStatus') | Should -Be 'ok'
+    }
+
+    It 'reports a collector that throws as no data with the reason, and still builds the rest' {
+        $c = New-OkCollectors
+        $c['disk'] = { param($r) throw 'Brak uprawnień' }
+        $c['startup'] = { param($r) throw 'zadania niedostępne' }
+        $a = Invoke-RepairAudit -Collectors $c -Runner { } -Now ([datetime]'2026-10-15T10:00:00') -ComputerName 'PC1'
+        $d = @($a.findings) | Where-Object group -eq 'disk'
+        $d.status | Should -Be 'nodata'
+        $d.summary | Should -Match 'Brak uprawnień'
+        @($a.findings).Count | Should -Be 6
+        (@($a.notes) -join ' ') | Should -Match 'zadania niedostępne'
+        (Get-AuditMetric -Audit $a -Name 'StartupCount') | Should -BeNullOrEmpty
+    }
+
+    It 'never throws with the real collectors, even where nothing is available (this machine is not Windows)' {
+        { Invoke-RepairAudit -Runner { param($e, $a, $t) @{ ExitCode = -1; Output = @(); TimedOut = $false } } } | Should -Not -Throw
+    }
+
+    It 'can be serialised to JSON and rendered after a round trip' {
+        $a = Invoke-RepairAudit -Collectors (New-OkCollectors) -Runner { } -Now ([datetime]'2026-10-15T10:00:00') -ComputerName 'PC1'
+        $dir = Join-Path $TestDrive 'run1'
+        $p = Save-AuditFile -Audit $a -Dir $dir -Name 'audit-before'
+        Test-Path -LiteralPath $p | Should -BeTrue
+        $back = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
+        (Format-AuditReport -Audit $back) | Should -Match 'Raport systemu: PC1'
+        (Get-AuditMetric -Audit $back -Name 'FreeBytes') | Should -Be 20GB
+    }
+}
+
+Describe 'New-RepairRunDir' {
+    It 'creates a timestamped folder under repair' {
+        $d = New-RepairRunDir -WorkDir (Join-Path $TestDrive 'wr') -Now ([datetime]'2026-10-15T10:11:12')
+        Test-Path -LiteralPath $d | Should -BeTrue
+        (Split-Path -Leaf $d) | Should -Be '20261015-101112'
+        (Split-Path -Leaf (Split-Path -Parent $d)) | Should -Be 'repair'
+    }
+}
+
+Describe 'audit entry script' {
+    It 'runs end to end under StrictMode as a file, writes the report and exits 0' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        $home2 = Join-Path $TestDrive 'wrhome'
+        $env:WINRES_HOME = $home2
+        try {
+            $out = & $pwsh -NoProfile -File (Join-Path $root 'Get-WinAudit.ps1') 2>&1
+            $LASTEXITCODE | Should -Be 0 -Because ($out -join "`n")
+        }
+        finally { Remove-Item Env:WINRES_HOME -ErrorAction SilentlyContinue }
+        @(Get-ChildItem -LiteralPath (Join-Path $home2 'repair') -Recurse -Filter 'raport.txt').Count | Should -Be 1
+    }
+
+    It 'is reachable through Invoke-Resurect.ps1 -Action audit' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        $env:WINRES_HOME = (Join-Path $TestDrive 'wrhome2')
+        try {
+            & $pwsh -NoProfile -File (Join-Path $root 'Invoke-Resurect.ps1') -Action audit *> $null
+            $LASTEXITCODE | Should -Be 0
+        }
+        finally { Remove-Item Env:WINRES_HOME -ErrorAction SilentlyContinue }
+    }
+}

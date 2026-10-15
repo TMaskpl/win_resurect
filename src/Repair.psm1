@@ -250,3 +250,363 @@ function Compare-Audits {
     if ($null -ne $b -and $null -ne $a) { [void]$lines.Add(('Integralność systemu: {0} -> {1}' -f (Get-StatusLabel $b), (Get-StatusLabel $a))) }
     return @($lines)
 }
+
+function Test-IsAdmin {
+    try { return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+    catch { return $false }
+}
+
+function Invoke-NativeCommand {
+    param([Parameter(Mandatory)][string]$Exe, [string[]]$ArgList = @(), [int]$TimeoutSec = 0, [switch]$Quiet)
+    $job = Start-Job -ScriptBlock {
+        param($e, $a)
+        & $e @a 2>&1 | ForEach-Object { "$_" }
+        "__EXIT__:$LASTEXITCODE"
+    } -ArgumentList $Exe, @($ArgList)
+    $lines = New-Object System.Collections.ArrayList
+    $exit = $null
+    $timedOut = $false
+    $start = Get-Date
+    try {
+        while ($true) {
+            $done = Wait-Job -Job $job -Timeout 1
+            foreach ($o in @(Receive-Job -Job $job -ErrorAction SilentlyContinue)) {
+                $s = "$o"
+                if ($s -match '^__EXIT__:(-?\d*)$') { $exit = if ($Matches[1] -ne '') { [int]$Matches[1] } else { -1 }; continue }
+                [void]$lines.Add($s)
+                if (-not $Quiet) { Write-Host (Hide-Secrets -Text $s) }
+            }
+            if ($done) { break }
+            if ($TimeoutSec -gt 0 -and ((Get-Date) - $start).TotalSeconds -gt $TimeoutSec) { $timedOut = $true; break }
+        }
+    }
+    finally {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+    if ($timedOut) { [void]$lines.Add('Przekroczono limit czasu; polecenie mogło nadal działać w tle.'); $exit = -1 }
+    if ($null -eq $exit) { $exit = -1 }
+    return @{ ExitCode = $exit; Output = @($lines); TimedOut = $timedOut }
+}
+
+function New-NativeRunner {
+    param([switch]$Quiet)
+    $flag = if ($Quiet) { '$true' } else { '$false' }
+    return [scriptblock]::Create('param($Exe, $ArgList, $TimeoutSec = 0) Invoke-NativeCommand -Exe $Exe -ArgList @($ArgList) -TimeoutSec $TimeoutSec -Quiet:' + $flag)
+}
+
+function Get-CleanupRoots {
+    param([string]$SystemRoot = $env:SystemRoot, [string]$UsersDir = '')
+    $sr = if ($SystemRoot -and $SystemRoot -match '^[A-Za-z]:\\') { $SystemRoot.TrimEnd('\') } else { 'C:\Windows' }
+    if (-not $UsersDir) { $UsersDir = '{0}\Users' -f $(if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }) }
+    $userTemps = @()
+    if (Test-Path -LiteralPath $UsersDir) {
+        $userTemps = @(Get-ChildItem -LiteralPath $UsersDir -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object { '{0}\AppData\Local\Temp' -f $_.FullName })
+    }
+    return [ordered]@{
+        'temp-user'   = $userTemps
+        'temp-win'    = @('{0}\Temp' -f $sr)
+        'wu-download' = @('{0}\SoftwareDistribution\Download' -f $sr)
+        'dumps'       = @(('{0}\Minidump' -f $sr), ('{0}\LiveKernelReports' -f $sr))
+    }
+}
+
+function Get-DirectorySize {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return 0 }
+    $sum = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+    if ($null -eq $sum) { return 0 }
+    return [long]$sum
+}
+
+function Test-ProtectedStartupItem {
+    param([Parameter(Mandatory)]$Item)
+    if ($Item.Kind -eq 'folder') { return $true }
+    $pub = "$($Item.Publisher)"
+    if ($pub -match '(?i)microsoft') { return $true }
+    $sec = '(?i)antivir|defender|security|kaspersky|eset|bitdefender|norton|mcafee|sophos|avast|\bavg\b|malwarebytes|trend micro|f-secure|crowdstrike|sentinel'
+    if ("$($Item.Name)" -match $sec -or $pub -match $sec) { return $true }
+    return $false
+}
+
+function Get-FilePublisher {
+    param([string]$Command)
+    if (-not $Command) { return '' }
+    if ($Command -notmatch '^\s*"?([^"]+?\.(exe|dll|sys))') { return '' }
+    try { return "$((Get-Item -LiteralPath $Matches[1] -ErrorAction Stop).VersionInfo.CompanyName)" } catch { return '' }
+}
+
+function Get-StartupItems {
+    # Tylko Windows. Zwraca wpisy Run, zadania z wyzwalaczem logowania/startu, usługi automatyczne i skróty z Autostartu.
+    $items = New-Object System.Collections.ArrayList
+    foreach ($key in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run') {
+        $p = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        foreach ($prop in $p.PSObject.Properties) {
+            if ($prop.Name -like 'PS*') { continue }
+            $it = @{ Name = $prop.Name; Kind = 'run'; Command = "$($prop.Value)"; Publisher = (Get-FilePublisher "$($prop.Value)"); Location = $key; Disableable = $true; Reason = '' }
+            $prot = Test-ProtectedStartupItem -Item $it
+            $it.Disableable = -not $prot; if ($prot) { $it.Reason = 'chronione' }
+            [void]$items.Add($it)
+        }
+    }
+    foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' -and $_.TaskPath -notlike '\Microsoft\*' })) {
+        $trig = @($t.Triggers | Where-Object { $_.CimClass.CimClassName -in 'MSFT_TaskLogonTrigger', 'MSFT_TaskBootTrigger' })
+        if ($trig.Count -eq 0) { continue }
+        $cmd = if (@($t.Actions).Count -gt 0) { "$($t.Actions[0].Execute)" } else { '' }
+        $it = @{ Name = $t.TaskName; Kind = 'task'; Command = $cmd; Publisher = (Get-FilePublisher $cmd); Location = $t.TaskPath; Disableable = $true; Reason = '' }
+        $prot = Test-ProtectedStartupItem -Item $it
+        $it.Disableable = -not $prot; if ($prot) { $it.Reason = 'chronione' }
+        [void]$items.Add($it)
+    }
+    foreach ($s in @(Get-CimInstance Win32_Service -Filter "StartMode='Auto'" -ErrorAction SilentlyContinue)) {
+        if ("$($s.PathName)" -match '(?i)\\windows\\system32\\') { continue }
+        $it = @{ Name = $s.Name; Kind = 'service'; Command = "$($s.PathName)"; Publisher = (Get-FilePublisher "$($s.PathName)"); Location = 'service'; Disableable = $true; Reason = '' }
+        $prot = Test-ProtectedStartupItem -Item $it
+        $it.Disableable = -not $prot; if ($prot) { $it.Reason = 'chronione' }
+        [void]$items.Add($it)
+    }
+    foreach ($dir in ('{0}\Microsoft\Windows\Start Menu\Programs\StartUp' -f $env:ProgramData), ('{0}\Microsoft\Windows\Start Menu\Programs\Startup' -f $env:APPDATA)) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })) {
+            [void]$items.Add(@{ Name = $f.Name; Kind = 'folder'; Command = $f.FullName; Publisher = ''; Location = $dir; Disableable = $false; Reason = 'wyłącz ręcznie (folder Autostart)' })
+        }
+    }
+    return @($items)
+}
+
+function Get-DiskFacts {
+    param($Runner)
+    $out = @()
+    foreach ($d in @(Get-PhysicalDisk -ErrorAction Stop)) {
+        $rc = $null
+        try { $rc = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
+        $out += @{
+            Name       = "$($d.FriendlyName)"
+            Health     = "$($d.HealthStatus)"
+            Wear       = $(if ($rc -and $null -ne $rc.Wear) { [int]$rc.Wear } else { $null })
+            Unreadable = $(if ($rc -and $null -ne $rc.ReadErrorsUncorrected) { [long]$rc.ReadErrorsUncorrected } else { $null })
+        }
+    }
+    return @{ Disks = @($out) }
+}
+
+function Get-SpaceFacts {
+    param($Runner)
+    $sys = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+    $drives = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | ForEach-Object { @{ Drive = "$($_.DeviceID)"; Free = [long]$_.FreeSpace; Total = [long]$_.Size } })
+    return @{ SystemDrive = $sys; Drives = $drives }
+}
+
+function Get-CandidateSizes {
+    param($Runner)
+    $sizes = [ordered]@{}
+    $roots = Get-CleanupRoots
+    foreach ($id in $roots.Keys) {
+        $sum = 0L
+        foreach ($p in $roots[$id]) { $sum += Get-DirectorySize -Path $p }
+        $sizes[$id] = $sum
+    }
+    $sd = if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }
+    $sizes['recycle'] = Get-DirectorySize -Path ('{0}\$Recycle.Bin' -f $sd)
+    $hib = Get-Item -LiteralPath ('{0}\hiberfil.sys' -f $sd) -Force -ErrorAction SilentlyContinue
+    $sizes['hibernate'] = $(if ($hib) { [long]$hib.Length } else { 0L })
+    $cs = & $Runner 'dism.exe' @('/Online', '/Cleanup-Image', '/AnalyzeComponentStore') 600
+    return @{ Sizes = $sizes; ComponentStoreCleanupRecommended = (ConvertFrom-AnalyzeComponentStore -Text ($cs.Output -join "`n")) }
+}
+
+function Get-BootFacts {
+    param($Runner)
+    $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 100 } -MaxEvents 10 -ErrorAction Stop)
+    $secs = @()
+    foreach ($e in $events) {
+        $x = [xml]$e.ToXml()
+        $d = $x.Event.EventData.Data | Where-Object { $_.Name -eq 'BootTime' } | Select-Object -First 1
+        if ($d) { $secs += ([double]$d.'#text') / 1000.0 }
+    }
+    return @{ Seconds = @($secs) }
+}
+
+function Get-IntegrityFacts {
+    param($Runner)
+    $r = & $Runner 'dism.exe' @('/Online', '/Cleanup-Image', '/CheckHealth') 300
+    $log = Join-Path $env:SystemRoot 'Logs\CBS\CBS.log'
+    $lines = @()
+    if (Test-Path -LiteralPath $log) { $lines = @(Get-Content -LiteralPath $log -Tail 20000 -ErrorAction SilentlyContinue) }
+    return @{ Dism = (ConvertFrom-DismCheckHealth -Text ($r.Output -join "`n")); SfcUnrepaired = (Get-SfcLogSummary -Lines $lines).Unrepaired }
+}
+
+function Test-PendingReboot {
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        try { if (Test-Path -LiteralPath $k) { return $true } } catch { }
+    }
+    return $false
+}
+
+function Get-UpdateFacts {
+    param($Runner)
+    $types = @{}
+    foreach ($n in 'wuauserv', 'BITS', 'cryptsvc') {
+        $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+        if ($s) { $types[$n] = "$($s.StartType)" }
+    }
+    $hf = Get-HotFix -ErrorAction SilentlyContinue | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending | Select-Object -First 1
+    $days = $null
+    if ($hf) { $days = [int]((Get-Date) - [datetime]$hf.InstalledOn).TotalDays }
+    $codes = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-WindowsUpdateClient/Operational'; Id = 20; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue | ForEach-Object { if ($_.Message -match '0x[0-9A-Fa-f]{8}') { $Matches[0] } })
+    $rep = $codes | Group-Object | Where-Object { $_.Count -ge 3 } | Sort-Object Count -Descending | Select-Object -First 1
+    return @{ StartTypes = $types; DaysSinceInstall = $days; PendingReboot = (Test-PendingReboot); RepeatedErrorCode = $(if ($rep) { $rep.Name } else { $null }) }
+}
+
+function Get-MemoryFacts {
+    param($Runner)
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    $total = [double]$os.TotalVisibleMemorySize
+    $top = @(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 | ForEach-Object { '{0} ({1})' -f $_.ProcessName, (Format-Size ([long]$_.WorkingSet64)) })
+    $crashes = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Power'; Id = 41; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue).Count
+    return @{ TotalGB = [math]::Round($total / 1MB, 1); UsedPct = [math]::Round(100.0 * ($total - [double]$os.FreePhysicalMemory) / $total, 0); CrashCount = $crashes; TopProcesses = $top }
+}
+
+function Get-DefaultCollectors {
+    return @{
+        disk       = { param($r) Get-DiskFacts -Runner $r }
+        space      = { param($r) Get-SpaceFacts -Runner $r }
+        candidates = { param($r) Get-CandidateSizes -Runner $r }
+        boot       = { param($r) Get-BootFacts -Runner $r }
+        startup    = { param($r) @{ Items = @(Get-StartupItems) } }
+        integrity  = { param($r) Get-IntegrityFacts -Runner $r }
+        updates    = { param($r) Get-UpdateFacts -Runner $r }
+        memory     = { param($r) Get-MemoryFacts -Runner $r }
+    }
+}
+
+function Invoke-RepairAudit {
+    param(
+        [hashtable]$Collectors = (Get-DefaultCollectors),
+        [scriptblock]$Runner = (New-NativeRunner -Quiet),
+        [datetime]$Now = (Get-Date),
+        [string]$ComputerName = $env:COMPUTERNAME
+    )
+    $findings = New-Object System.Collections.ArrayList
+    $notes = New-Object System.Collections.ArrayList
+    $metrics = [ordered]@{ FreeBytes = $null; BootAvgSec = $null; StartupCount = $null; IntegrityStatus = $null }
+    $candidates = @()
+    $startup = @()
+    $componentStore = $null
+
+    $collect = {
+        param($name)
+        try { return @{ Ok = $true; Data = (& $Collectors[$name] $Runner) } }
+        catch { return @{ Ok = $false; Reason = $_.Exception.Message } }
+    }
+    $noData = {
+        param($group, $reason)
+        [void]$findings.Add((New-Finding -Group $group -Status 'nodata' -Summary ('Brak danych: {0}' -f $reason)))
+    }
+
+    # dysk fizyczny
+    $r = & $collect 'disk'
+    if ($r.Ok) {
+        $st = Get-DiskHealthStatus -Disks @($r.Data.Disks)
+        $detail = (@($r.Data.Disks) | ForEach-Object { '{0}: {1}{2}' -f $_.Name, $_.Health, $(if ($null -ne $_.Wear) { ", zużycie $($_.Wear)%" } else { '' }) }) -join "`n"
+        if ($st -eq 'nodata') { & $noData 'disk' 'brak odczytu dysków fizycznych' }
+        else { [void]$findings.Add((New-Finding -Group 'disk' -Status $st -Summary (Get-FindingSummary -Group 'disk' -Status $st) -Detail $detail)) }
+    }
+    else { & $noData 'disk' $r.Reason }
+
+    # miejsce
+    $r = & $collect 'space'
+    if ($r.Ok) {
+        $stList = @(); $detail = @(); $sysFree = $null
+        foreach ($d in @($r.Data.Drives)) {
+            $stList += (Get-SpaceStatus -FreeBytes ([long]$d.Free) -TotalBytes ([long]$d.Total))
+            $detail += ('{0}: wolne {1} z {2}' -f $d.Drive, (Format-Size ([long]$d.Free)), (Format-Size ([long]$d.Total)))
+            if ($d.Drive -eq $r.Data.SystemDrive) { $sysFree = [long]$d.Free }
+        }
+        $st = Get-WorstAuditStatus -Statuses $stList
+        if ($st -eq 'nodata') { & $noData 'space' 'brak odczytu woluminów' }
+        else { [void]$findings.Add((New-Finding -Group 'space' -Status $st -Summary (Get-FindingSummary -Group 'space' -Status $st) -Detail ($detail -join "`n"))) }
+        $metrics['FreeBytes'] = $sysFree
+    }
+    else { & $noData 'space' $r.Reason }
+
+    # kandydaci (bez oceny)
+    $r = & $collect 'candidates'
+    if ($r.Ok) { $candidates = @(Get-CleanupCandidates -Sizes $r.Data.Sizes); $componentStore = $r.Data.ComponentStoreCleanupRecommended }
+    else { [void]$notes.Add(('Brak danych: kandydaci do sprzątnięcia ({0})' -f $r.Reason)) }
+
+    # start
+    $r = & $collect 'boot'
+    if ($r.Ok) {
+        $secs = @($r.Data.Seconds | ForEach-Object { [double]$_ })
+        $st = Get-BootStatus -Seconds $secs
+        if ($st -eq 'nodata') { & $noData 'boot' 'brak zdarzeń czasu startu' }
+        else {
+            $avg = [math]::Round(($secs | Measure-Object -Average).Average)
+            [void]$findings.Add((New-Finding -Group 'boot' -Status $st -Summary (Get-FindingSummary -Group 'boot' -Status $st) -Detail ('Średnio {0} s z {1} ostatnich startów' -f $avg, $secs.Count)))
+            $metrics['BootAvgSec'] = ($secs | Measure-Object -Average).Average
+        }
+    }
+    else { & $noData 'boot' $r.Reason }
+
+    # autostart (bez oceny)
+    $r = & $collect 'startup'
+    if ($r.Ok) { $startup = @($r.Data.Items); $metrics['StartupCount'] = $startup.Count }
+    else { [void]$notes.Add(('Brak danych: autostart ({0})' -f $r.Reason)) }
+
+    # integralność
+    $r = & $collect 'integrity'
+    if ($r.Ok) {
+        $st = Get-IntegrityStatus -Dism $r.Data.Dism -SfcUnrepaired ([int]$r.Data.SfcUnrepaired)
+        if ($st -eq 'nodata') { & $noData 'integrity' 'nie rozpoznano wyniku DISM (inny język systemu?)' }
+        else { [void]$findings.Add((New-Finding -Group 'integrity' -Status $st -Summary (Get-FindingSummary -Group 'integrity' -Status $st) -Detail ('DISM: {0}; niezałatane pliki w ostatnim sfc: {1}' -f $r.Data.Dism, $r.Data.SfcUnrepaired))) }
+        $metrics['IntegrityStatus'] = $st
+    }
+    else { & $noData 'integrity' $r.Reason }
+
+    # aktualizacje
+    $r = & $collect 'updates'
+    if ($r.Ok) {
+        $st = Get-UpdateStatus -StartTypes $r.Data.StartTypes -DaysSinceInstall $r.Data.DaysSinceInstall -PendingReboot ([bool]$r.Data.PendingReboot) -RepeatedErrorCode $r.Data.RepeatedErrorCode
+        if ($st -eq 'nodata') { & $noData 'updates' 'brak informacji o ostatniej aktualizacji' }
+        else { [void]$findings.Add((New-Finding -Group 'updates' -Status $st -Summary (Get-FindingSummary -Group 'updates' -Status $st) -Detail ('Ostatnia instalacja: {0} dni temu; oczekuje restart: {1}; powtarzający się błąd: {2}' -f $r.Data.DaysSinceInstall, $r.Data.PendingReboot, $(if ($r.Data.RepeatedErrorCode) { $r.Data.RepeatedErrorCode } else { 'brak' })))) }
+    }
+    else { & $noData 'updates' $r.Reason }
+
+    # pamięć
+    $r = & $collect 'memory'
+    if ($r.Ok) {
+        $st = Get-MemoryStatus -TotalGB ([double]$r.Data.TotalGB) -UsedPct ([double]$r.Data.UsedPct) -CrashCount ([int]$r.Data.CrashCount)
+        [void]$findings.Add((New-Finding -Group 'memory' -Status $st -Summary (Get-FindingSummary -Group 'memory' -Status $st) -Detail ("RAM {0} GB, zajęte {1}%; restarty awaryjne (30 dni): {2}`nNajwięksi: {3}" -f $r.Data.TotalGB, $r.Data.UsedPct, $r.Data.CrashCount, (@($r.Data.TopProcesses) -join ', '))))
+    }
+    else { & $noData 'memory' $r.Reason }
+
+    return [pscustomobject]@{
+        version        = 1
+        computer       = $ComputerName
+        generated      = $Now.ToString('s')
+        findings       = @($findings)
+        candidates     = @($candidates)
+        startup        = @($startup)
+        componentStore = $componentStore
+        notes          = @($notes)
+        metrics        = $metrics
+    }
+}
+
+function New-RepairRunDir {
+    param([Parameter(Mandatory)][string]$WorkDir, [Parameter(Mandatory)][datetime]$Now)
+    $parent = Join-Path $WorkDir 'repair'
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    if ([Environment]::OSVersion.Platform -eq 'Win32NT') { Set-RestrictedAcl -Path $parent }
+    $dir = Join-Path $parent $Now.ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    return $dir
+}
+
+function Save-AuditFile {
+    param([Parameter(Mandatory)]$Audit, [Parameter(Mandatory)][string]$Dir, [string]$Name = 'audit')
+    if (-not (Test-Path -LiteralPath $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Out-Null }
+    $p = Join-Path $Dir ($Name + '.json')
+    $Audit | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $p -Encoding UTF8
+    return $p
+}
