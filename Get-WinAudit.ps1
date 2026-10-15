@@ -13,14 +13,31 @@ if (-not (Test-IsAdmin)) {
     Write-Host 'Uwaga: bez uprawnień administratora część danych (SMART, DISM) będzie niedostępna. Użyj Start.cmd.' -ForegroundColor Yellow
 }
 $now = Get-Date
-Write-Host 'Zbieram dane o systemie (to potrwa około minuty, bez żadnych zmian)...'
+Write-Host 'Zbieram dane o systemie (to potrwa kilka minut, bez żadnych zmian)...'
 $audit = Invoke-RepairAudit -Now $now
-$dir = New-RepairRunDir -WorkDir (Get-DailyHome) -Now $now
-Save-AuditFile -Audit $audit -Dir $dir -Name 'audit' | Out-Null
 $report = Format-AuditReport -Audit $audit
-Set-Content -LiteralPath (Join-Path $dir 'raport.txt') -Value $report -Encoding UTF8
 Write-Host ''
 Write-Host $report
 Write-Host ''
-Write-Host "Zapisano: $dir"
+
+# Raport jest już na ekranie; zapis nie może go przekreślić (zwykły użytkownik nie zapisze w ProgramData).
+$dir = $null
+try { $dir = New-RepairRunDir -WorkDir (Get-DailyHome) -Now $now }
+catch {
+    $fallback = Join-Path ([System.IO.Path]::GetTempPath()) ('WinResurect-audit-' + $now.ToString('yyyyMMdd-HHmmss'))
+    try {
+        New-Item -ItemType Directory -Force -Path $fallback -ErrorAction Stop | Out-Null
+        $dir = $fallback
+        Write-Host "Brak dostępu do katalogu roboczego (uruchom jako administrator). Zapis awaryjny: $dir" -ForegroundColor Yellow
+    }
+    catch { Write-Host 'Nie udało się zapisać raportu na dysku; powyższy wynik jest tylko na ekranie.' -ForegroundColor Yellow }
+}
+if ($dir) {
+    try {
+        Save-AuditFile -Audit $audit -Dir $dir -Name 'audit' | Out-Null
+        Set-Content -LiteralPath (Join-Path $dir 'raport.txt') -Value $report -Encoding UTF8 -ErrorAction Stop
+        Write-Host "Zapisano: $dir"
+    }
+    catch { Write-Host "Nie udało się zapisać raportu: $($_.Exception.Message)" -ForegroundColor Yellow }
+}
 exit 0

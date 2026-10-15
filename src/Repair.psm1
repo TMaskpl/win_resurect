@@ -218,8 +218,16 @@ function Format-AuditReport {
         [void]$L.Add('DO ODZYSKANIA (kandydaci do sprzątnięcia)')
         foreach ($c in $cand) { [void]$L.Add(('  {0}: {1}' -f $c.label, (Format-Size ([long]$c.bytes)))) }
     }
-    $sc = Get-AuditMetric -Audit $Audit -Name 'StartupCount'
-    if ($null -ne $sc) { [void]$L.Add(''); [void]$L.Add(('Pozycji autostartu: {0}' -f $sc)) }
+    $su = @($Audit.startup)
+    if ($su.Count -gt 0) {
+        [void]$L.Add('')
+        [void]$L.Add(('AUTOSTART ({0} pozycji)' -f $su.Count))
+        foreach ($it in @($su | Sort-Object { $_.Name })) {
+            $pub = if ($it.Publisher) { $it.Publisher } else { 'nieznany wydawca' }
+            $tag = if ($it.Disableable) { '' } elseif ($it.Reason) { ' [{0}]' -f $it.Reason } else { ' [chronione]' }
+            [void]$L.Add(('  {0} ({1}, {2}){3}' -f $it.Name, $it.Kind, $pub, $tag))
+        }
+    }
     $notes = @($Audit.notes)
     if ($notes.Count -gt 0) {
         [void]$L.Add('')
@@ -297,7 +305,7 @@ function New-NativeRunner {
 
 function Get-CleanupRoots {
     param([string]$SystemRoot = $env:SystemRoot, [string]$UsersDir = '')
-    $sr = if ($SystemRoot -and $SystemRoot -match '^[A-Za-z]:\\') { $SystemRoot.TrimEnd('\') } else { 'C:\Windows' }
+    $sr = if ($SystemRoot -and $SystemRoot -match '(?i)^[A-Za-z]:\\Windows\\?$') { $SystemRoot.TrimEnd('\') } else { 'C:\Windows' }
     if (-not $UsersDir) { $UsersDir = '{0}\Users' -f $(if ($env:SystemDrive) { $env:SystemDrive } else { 'C:' }) }
     $userTemps = @()
     if (Test-Path -LiteralPath $UsersDir) {
@@ -596,10 +604,11 @@ function Invoke-RepairAudit {
 function New-RepairRunDir {
     param([Parameter(Mandatory)][string]$WorkDir, [Parameter(Mandatory)][datetime]$Now)
     $parent = Join-Path $WorkDir 'repair'
-    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null
     if ([Environment]::OSVersion.Platform -eq 'Win32NT') { Set-RestrictedAcl -Path $parent }
     $dir = Join-Path $parent $Now.ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw ('Nie udało się utworzyć katalogu przebiegu: {0}' -f $dir) }
     return $dir
 }
 
@@ -607,7 +616,7 @@ function Save-AuditFile {
     param([Parameter(Mandatory)]$Audit, [Parameter(Mandatory)][string]$Dir, [string]$Name = 'audit')
     if (-not (Test-Path -LiteralPath $Dir)) { New-Item -ItemType Directory -Force -Path $Dir | Out-Null }
     $p = Join-Path $Dir ($Name + '.json')
-    $Audit | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $p -Encoding UTF8
+    $Audit | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $p -Encoding UTF8 -ErrorAction Stop
     return $p
 }
 
@@ -659,6 +668,17 @@ function ConvertTo-NormalizedPath {
     return $p.TrimEnd('/')
 }
 
+function Test-CleanupRootSafe {
+    # Stała lista katalogów, które wolno czyścić; niezależna od zmiennych środowiskowych.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if ($Path -match '(^|[\\/])\.\.([\\/]|$)') { return $false }
+    $p = ConvertTo-NormalizedPath -Path $Path
+    if ($p -match '(?i)^[A-Za-z]:\\Windows\\(Temp|SoftwareDistribution\\Download|Minidump|LiveKernelReports)$') { return $true }
+    if ($p -match '(?i)^[A-Za-z]:\\Users\\[^\\]+\\AppData\\Local\\Temp$') { return $true }
+    return $false
+}
+
 function Test-SafeDeleteTarget {
     param([string]$Path, [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$AllowedRoots)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
@@ -681,6 +701,8 @@ function Remove-FolderContents {
     $res = @{ FreedBytes = 0L; Failed = 0; Skipped = 0 }
     if (-not (Test-SafeDeleteTarget -Path $Path -AllowedRoots $AllowedRoots)) { throw ('Odmowa: ścieżka poza dozwolonymi katalogami: {0}' -f $Path) }
     if (-not (Test-Path -LiteralPath $Path)) { return $res }
+    $rootItem = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($rootItem -and ($rootItem.LinkType -or ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint))) { $res.Skipped++; return $res }
     $cut = $Now.AddDays(-$OlderThanDays)
     foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
         if ($item.LinkType) { $res.Skipped++; continue }
@@ -788,13 +810,14 @@ function New-RepairContext {
     param(
         $Audit, [string]$RunDir = '', [hashtable]$Ops = (Get-DefaultOps), [scriptblock]$Runner = (New-NativeRunner),
         [scriptblock]$Ask = { param($q) (Read-Host $q) -match '^[TtYy]' }, [scriptblock]$Prompt = { param($q) Read-Host $q },
-        [datetime]$Now = (Get-Date), [string]$SystemRoot = '', [hashtable]$Roots = $null
+        [datetime]$Now = (Get-Date), [string]$SystemRoot = '', [hashtable]$Roots = $null,
+        [scriptblock]$RootPolicy = { param($p) Test-CleanupRootSafe -Path $p }
     )
     $sr = 'C:\Windows'
     if ($SystemRoot -and $SystemRoot -match '^([A-Za-z]:\\|/)') { $sr = $SystemRoot.TrimEnd('\', '/') }
     elseif (-not $SystemRoot -and $env:SystemRoot -and $env:SystemRoot -match '^[A-Za-z]:\\') { $sr = $env:SystemRoot.TrimEnd('\') }
     if (-not $Roots -or $Roots.Count -eq 0) { $Roots = Get-CleanupRoots -SystemRoot $sr }
-    return @{ Audit = $Audit; RunDir = $RunDir; Ops = $Ops; Runner = $Runner; Ask = $Ask; Prompt = $Prompt; Now = $Now; SystemRoot = $sr; Roots = $Roots }
+    return @{ Audit = $Audit; RunDir = $RunDir; Ops = $Ops; Runner = $Runner; Ask = $Ask; Prompt = $Prompt; Now = $Now; SystemRoot = $sr; Roots = $Roots; RootPolicy = $RootPolicy }
 }
 
 function Invoke-RepairModule {
@@ -809,6 +832,22 @@ function Invoke-RepairModule {
         return @{ Name = $name; Status = $r.Status; Messages = @($r.Messages) }
     }
     catch { return @{ Name = $name; Status = 'fail'; Messages = @(('Błąd: {0}' -f $_.Exception.Message)) } }
+}
+
+function Restore-Services {
+    # Uruchamia z powrotem usługi, które działały; błąd jednej nie przerywa pozostałych.
+    param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][string[]]$Names, [Parameter(Mandatory)][hashtable]$Was)
+    $errs = @()
+    foreach ($n in $Names) {
+        if ($Was[$n] -ne 'Running') { continue }
+        try { & $Context.Ops.Service $n 'start' | Out-Null }
+        catch {
+            $m = ('Nie uruchomiono usługi {0}: {1}' -f $n, $_.Exception.Message)
+            Write-Warning $m
+            $errs += $m
+        }
+    }
+    return $errs
 }
 
 function Get-CleanupModule {
@@ -830,6 +869,12 @@ function Get-CleanupModule {
         Apply = {
             param($c)
             $ids = @($c.Audit.candidates | ForEach-Object { $_.id })
+            foreach ($id in 'temp-user', 'temp-win', 'wu-download', 'dumps') {
+                if ($ids -notcontains $id) { continue }
+                foreach ($p in @($c.Roots[$id] | Where-Object { $_ })) {
+                    if (-not (& $c.RootPolicy $p)) { throw ('Odmowa: katalog spoza listy dozwolonych do czyszczenia: {0}' -f $p) }
+                }
+            }
             $msgs = @(); $freed = 0L; $failed = 0; $skipped = 0
             $wuWasRunning = $false
             try {
@@ -848,7 +893,7 @@ function Get-CleanupModule {
                 }
             }
             finally {
-                if ($wuWasRunning) { & $c.Ops.Service 'wuauserv' 'start' | Out-Null }
+                $null = Restore-Services -Context $c -Names @('wuauserv') -Was @{ wuauserv = $(if ($wuWasRunning) { 'Running' } else { '' }) }
             }
             if ($ids -contains 'recycle' -and (& $c.Ask 'Opróżnić kosz? Tego nie da się cofnąć. (t/n)')) {
                 & $c.Ops.ClearRecycleBin
@@ -870,10 +915,11 @@ function Get-CleanupModule {
 
 function ConvertFrom-SfcOutput {
     param([AllowEmptyString()][string]$Text = '')
-    $t = $Text -replace "`0", ''
-    if ($t -match '(?i)unable to fix|nie mo[żz]e naprawi|nie uda[łl]o si[ęe] naprawi') { return 'unrepairable' }
-    if ($t -match '(?i)successfully repaired|pomy[śs]lnie (je )?napraw') { return 'repaired' }
-    if ($t -match '(?i)did not find any integrity violations|nie wykry[łl]a [żz]adnych naruszeń|nie wykry[łl]a naruszeń') { return 'clean' }
+    # sfc pisze UTF-16; po przekierowaniu polskie litery bywają przekłamane, więc sprowadzamy tekst do ASCII i dopasowujemy luźno.
+    $t = ($Text -replace "`0", '') -replace '[^\x20-\x7E\r\n]', '?'
+    if ($t -match '(?i)unable to fix|nie mo.{1,3}e naprawi|nie uda.{1,3}o si.{1,3} naprawi') { return 'unrepairable' }
+    if ($t -match '(?i)successfully repaired|pomy.{1,3}lnie (je )?napraw') { return 'repaired' }
+    if ($t -match '(?i)did not find any integrity violations|nie wykry.{1,3}a .{1,3}adnych narusz') { return 'clean' }
     return 'unknown'
 }
 
@@ -1048,7 +1094,7 @@ function Get-WindowsUpdateModule {
                 $msgs += $(if ($r.ExitCode -eq 0) { 'Winsock zresetowany (zadziała po restarcie).' } else { ('netsh winsock reset: kod {0}.' -f $r.ExitCode) })
             }
             finally {
-                foreach ($n in @($svc)[($svc.Count - 1)..0]) { if ($was[$n] -eq 'Running') { & $c.Ops.Service $n 'start' | Out-Null } }
+                $null = Restore-Services -Context $c -Names @($svc)[($svc.Count - 1)..0] -Was $was
             }
             $msgs += 'Sprawdź Windows Update; jeśli system prosi o restart, wykonaj go po wizycie.'
             return @{ Status = 'done'; Messages = $msgs }
@@ -1072,7 +1118,7 @@ function Get-WindowsUpdateModule {
                 }
             }
             finally {
-                foreach ($n in @($svc)[($svc.Count - 1)..0]) { if ($was[$n] -eq 'Running') { & $c.Ops.Service $n 'start' | Out-Null } }
+                $null = Restore-Services -Context $c -Names @($svc)[($svc.Count - 1)..0] -Was $was
             }
             return $msgs
         }

@@ -3,6 +3,12 @@ BeforeAll {
     $src = Join-Path $script:root 'src'
     foreach ($m in 'WinResurect.psm1', 'DailyBackup.psm1', 'Repair.psm1') { Import-Module (Join-Path $src $m) -Force }
 
+    function New-TestLink {
+        param([string]$Path, [string]$Target)
+        $type = if ([Environment]::OSVersion.Platform -eq 'Win32NT') { 'Junction' } else { 'SymbolicLink' }
+        New-Item -ItemType $type -Path $Path -Target $Target | Out-Null
+    }
+
     function New-FakeRunner {
         param([object[]]$Responses = @())
         $log = New-Object System.Collections.ArrayList
@@ -18,15 +24,17 @@ BeforeAll {
     }
 
     function New-FakeOps {
-        param([hashtable]$States = @{}, [switch]$FailRename)
+        param([hashtable]$States = @{}, [switch]$FailRename, [string]$FailStart = '')
         $log = New-Object System.Collections.ArrayList
         $st = $States
         $fail = $FailRename.IsPresent
+        $failStart = $FailStart
         $ops = @{
             Service         = {
                 param($Name, $Action)
                 if ($Action -eq 'state') { if ($st.ContainsKey($Name)) { return $st[$Name] } return $null }
                 [void]$log.Add(('svc:{0}:{1}' -f $Action, $Name))
+                if ($Action -eq 'start' -and $Name -eq $failStart) { throw ('start {0} failed' -f $Name) }
             }.GetNewClosure()
             ClearRecycleBin = { [void]$log.Add('recycle') }.GetNewClosure()
             RenameItem      = {
@@ -47,8 +55,8 @@ BeforeAll {
     }
 
     function New-TestContext {
-        param($Audit, [hashtable]$Ops, [scriptblock]$Runner, [scriptblock]$Ask = { $true }, [scriptblock]$Prompt = { '' }, [hashtable]$Roots = @{}, [string]$SystemRoot = '', [string]$RunDir = '')
-        New-RepairContext -Audit $Audit -Ops $Ops -Runner $Runner -Ask $Ask -Prompt $Prompt -Roots $Roots -SystemRoot $SystemRoot -RunDir $RunDir -Now ([datetime]'2026-10-15T10:00:00')
+        param($Audit, [hashtable]$Ops, [scriptblock]$Runner, [scriptblock]$Ask = { $true }, [scriptblock]$Prompt = { '' }, [hashtable]$Roots = @{}, [string]$SystemRoot = '', [string]$RunDir = '', [scriptblock]$RootPolicy = { $true })
+        New-RepairContext -Audit $Audit -Ops $Ops -Runner $Runner -Ask $Ask -Prompt $Prompt -Roots $Roots -SystemRoot $SystemRoot -RunDir $RunDir -RootPolicy $RootPolicy -Now ([datetime]'2026-10-15T10:00:00')
     }
 }
 
@@ -495,16 +503,16 @@ Describe 'Remove-FolderContents' {
         { Remove-FolderContents -Path $d -AllowedRoots @((Join-Path $TestDrive 'inny')) } | Should -Throw '*Odmowa*'
         (Test-Path -LiteralPath (Join-Path $d 'keep.txt')) | Should -BeTrue
     }
-    It 'does not follow links: data behind a link stays intact (and the linked folder is skipped)' -Skip:([Environment]::OSVersion.Platform -eq 'Win32NT') {
+    It 'does not follow links: data behind a link stays intact (and the linked folder is skipped)' {
         $outside = Join-Path $TestDrive 'outside'
         New-Item -ItemType Directory -Force -Path $outside | Out-Null
         Set-Content -LiteralPath (Join-Path $outside 'precious.txt') -Value 'x'
         $d = Join-Path $TestDrive 'rf4'
         New-Item -ItemType Directory -Force -Path $d | Out-Null
-        New-Item -ItemType SymbolicLink -Path (Join-Path $d 'link') -Target $outside | Out-Null
+        New-TestLink -Path (Join-Path $d 'link') -Target $outside
         $nested = Join-Path $d 'wrap'
         New-Item -ItemType Directory -Force -Path $nested | Out-Null
-        New-Item -ItemType SymbolicLink -Path (Join-Path $nested 'link2') -Target $outside | Out-Null
+        New-TestLink -Path (Join-Path $nested 'link2') -Target $outside
         $r = Remove-FolderContents -Path $d -AllowedRoots @($d)
         (Test-Path -LiteralPath (Join-Path $outside 'precious.txt')) | Should -BeTrue
         $r.Skipped | Should -BeGreaterOrEqual 2
@@ -610,7 +618,7 @@ Describe 'New-RepairContext' {
         (New-RepairContext -Audit $null -RunDir '' -SystemRoot 'D:\Win\').SystemRoot | Should -Be 'D:\Win'
     }
     It 'builds the cleanup roots from the system root unless roots are injected' {
-        (New-RepairContext -Audit $null -RunDir '' -SystemRoot 'D:\Win').Roots['temp-win'] | Should -Contain 'D:\Win\Temp'
+        (New-RepairContext -Audit $null -RunDir '' -SystemRoot 'D:\Windows').Roots['temp-win'] | Should -Contain 'D:\Windows\Temp'
     }
 }
 
@@ -1142,5 +1150,117 @@ Describe 'documentation' {
         $d = Get-Content -LiteralPath (Join-Path $script:rootDir 'docs/NAPRAWA.md') -Raw -Encoding UTF8
         foreach ($m in 'system-repair', 'windows-update', 'cleanup', 'startup', '-ImageDate', '-SkipBackupCheck', '-Undo') { $d | Should -Match ([regex]::Escape($m)) -Because $m }
         $d | Should -Match '-Yes'
+    }
+}
+
+Describe 'review fixes: cleanup root policy (I1)' {
+    It 'accepts only the known cleanup folders, whatever drive they are on' {
+        foreach ($p in 'C:\Windows\Temp', 'c:\windows\temp\', 'D:\Windows\SoftwareDistribution\Download', 'C:\Windows\Minidump', 'C:\Windows\LiveKernelReports', 'C:\Users\Jan\AppData\Local\Temp') {
+            Test-CleanupRootSafe -Path $p | Should -BeTrue -Because $p
+        }
+        foreach ($p in '', 'C:\', 'C:\Windows', 'C:\Temp', 'C:\Users\Jan', 'C:\Users\Jan\Documents', 'C:\Users\Jan\Temp', 'C:\Users\Jan\SoftwareDistribution\Download', 'C:\Windows\Temp\..\System32', 'C:\Users\Jan\AppData\Local\Temp\x') {
+            Test-CleanupRootSafe -Path $p | Should -BeFalse -Because "'$p'"
+        }
+    }
+    It 'ignores a SystemRoot that is not a Windows folder instead of building paths from it' {
+        $r = Get-CleanupRoots -SystemRoot 'C:\Users\Jan' -UsersDir (Join-Path $TestDrive 'nousers')
+        $r['temp-win'] | Should -Contain 'C:\Windows\Temp'
+        $r['wu-download'] | Should -Contain 'C:\Windows\SoftwareDistribution\Download'
+        (Get-CleanupRoots -SystemRoot 'C:\' -UsersDir (Join-Path $TestDrive 'nousers'))['temp-win'] | Should -Contain 'C:\Windows\Temp'
+    }
+    It 'cleanup refuses a root outside the policy before touching a service or a file' {
+        $d = Join-Path $TestDrive 'docs-i1'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        Set-Content -LiteralPath (Join-Path $d 'umowa.docx') -Value 'x'
+        $ops = New-FakeOps -States @{ wuauserv = 'Running' }
+        $cands = @([pscustomobject]@{ id = 'temp-win'; label = 'T'; bytes = 10 })
+        $c = New-RepairContext -Audit (New-TestAuditObject -Candidates $cands) -RunDir '' -Ops $ops.Ops -Runner (New-FakeRunner).Runner -Ask { $true } -Prompt { '' } -Roots @{ 'temp-user' = @(); 'temp-win' = @($d); 'wu-download' = @(); 'dumps' = @() }
+        $r = Invoke-RepairModule -Module (Get-CleanupModule) -Context $c
+        $r.Status | Should -Be 'fail'
+        ($r.Messages -join ' ') | Should -Match 'Odmowa'
+        (Test-Path -LiteralPath (Join-Path $d 'umowa.docx')) | Should -BeTrue
+        $ops.Log.Count | Should -Be 0
+    }
+}
+
+Describe 'review fixes: a link as the root itself (I2)' {
+    It 'does not empty the folder a link points to' {
+        $outside = Join-Path $TestDrive 'precious-i2'
+        New-Item -ItemType Directory -Force -Path $outside | Out-Null
+        Set-Content -LiteralPath (Join-Path $outside 'keep.txt') -Value 'x'
+        $link = Join-Path $TestDrive 'link-root-i2'
+        New-TestLink -Path $link -Target $outside
+        $r = Remove-FolderContents -Path $link -AllowedRoots @($link)
+        (Test-Path -LiteralPath (Join-Path $outside 'keep.txt')) | Should -BeTrue
+        $r.Skipped | Should -BeGreaterOrEqual 1
+        $r.FreedBytes | Should -Be 0
+    }
+}
+
+Describe 'review fixes: services come back even when one start fails (I3)' {
+    BeforeEach {
+        $script:sr = Join-Path $TestDrive ('w3' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path (Join-Path $script:sr 'SoftwareDistribution') | Out-Null
+        $script:run = Join-Path $TestDrive ('r3' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Force -Path $script:run | Out-Null
+        $script:all = @{ BITS = 'Running'; wuauserv = 'Running'; appidsvc = 'Running'; cryptsvc = 'Running' }
+    }
+    It 'tries to start every service and keeps the original error' {
+        $ops = New-FakeOps -States $script:all -FailRename -FailStart 'cryptsvc'
+        $c = New-TestContext -Audit (New-TestAuditObject) -Ops $ops.Ops -Runner (New-FakeRunner).Runner -SystemRoot $script:sr -RunDir $script:run
+        $r = Invoke-RepairModule -Module (Get-WindowsUpdateModule) -Context $c
+        $r.Status | Should -Be 'fail'
+        ($r.Messages -join ' ') | Should -Match 'rename failed'
+        foreach ($n in 'BITS', 'wuauserv', 'appidsvc', 'cryptsvc') { $ops.Log | Should -Contain "svc:start:$n" }
+    }
+}
+
+Describe 'review fixes: sfc output read through the wrong code page (I4)' {
+    BeforeAll {
+        function ConvertTo-Utf16AsLatin1([string]$Text) { [Text.Encoding]::GetEncoding('iso-8859-1').GetString([Text.Encoding]::Unicode.GetBytes($Text)) }
+    }
+    It 'recognises the Polish messages after UTF-16 was decoded as a single-byte code page' {
+        ConvertFrom-SfcOutput -Text (ConvertTo-Utf16AsLatin1 'Ochrona zasobów systemu Windows nie wykryła żadnych naruszeń integralności.') | Should -Be 'clean'
+        ConvertFrom-SfcOutput -Text (ConvertTo-Utf16AsLatin1 'Ochrona zasobów systemu Windows znalazła uszkodzone pliki i pomyślnie je naprawiła.') | Should -Be 'repaired'
+        ConvertFrom-SfcOutput -Text (ConvertTo-Utf16AsLatin1 'Ochrona zasobów systemu Windows znalazła uszkodzone pliki, ale nie może naprawić niektórych z nich.') | Should -Be 'unrepairable'
+    }
+    It 'still reports unknown for another language' {
+        ConvertFrom-SfcOutput -Text (ConvertTo-Utf16AsLatin1 'Der Windows-Ressourcenschutz hat nichts gefunden.') | Should -Be 'unknown'
+    }
+}
+
+Describe 'review fixes: audit does not die without write access (I5)' {
+    It 'prints the report and exits 0 even when the work folder cannot be created' {
+        $root = Split-Path $PSScriptRoot -Parent
+        $pwsh = (Get-Process -Id $PID).Path
+        $blocker = Join-Path $TestDrive 'iamafile'
+        Set-Content -LiteralPath $blocker -Value 'x'
+        $env:WINRES_HOME = Join-Path $blocker 'sub'
+        try {
+            $out = & $pwsh -NoProfile -File (Join-Path $root 'Get-WinAudit.ps1') 2>&1
+            $LASTEXITCODE | Should -Be 0 -Because ($out -join "`n")
+            ($out -join "`n") | Should -Match 'Raport systemu'
+        }
+        finally { Remove-Item Env:WINRES_HOME -ErrorAction SilentlyContinue }
+    }
+    It 'New-RepairRunDir and Save-AuditFile fail loudly instead of returning a folder that does not exist' {
+        $blocker = Join-Path $TestDrive 'iamafile2'
+        Set-Content -LiteralPath $blocker -Value 'x'
+        { New-RepairRunDir -WorkDir (Join-Path $blocker 'sub') -Now (Get-Date) } | Should -Throw
+    }
+}
+
+Describe 'review fixes: the report lists the startup items (I6)' {
+    It 'names every item with its kind and publisher, marks protected ones and leaves out the command line' {
+        $items = @(
+            @{ Name = 'Spotify'; Kind = 'run'; Command = 'C:\Users\Jan\AppData\s.exe --token=SEKRET'; Publisher = 'Spotify AB'; Location = 'HKCU'; Disableable = $true; Reason = '' },
+            @{ Name = 'Defender'; Kind = 'service'; Command = 'd.exe'; Publisher = 'Microsoft'; Location = 'service'; Disableable = $false; Reason = 'chronione' })
+        $a = New-TestAuditObject -Startup $items
+        $a.metrics['StartupCount'] = 2
+        $r = Format-AuditReport -Audit $a
+        $r | Should -Match 'AUTOSTART'
+        $r | Should -Match 'Spotify \(run, Spotify AB\)'
+        $r | Should -Match 'Defender.*chronione'
+        $r | Should -Not -Match 'SEKRET'
     }
 }
